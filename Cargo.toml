@@ -7,14 +7,15 @@ members = [
     "crates/airplay-client",
     "crates/airplay-app",
 ]
-# `cargo run` from the workspace root starts the receiver (GStreamer by default).
+# `cargo run` / `cargo build` from the workspace root → airplay-app
+# Default features: h264-dump + ffmpeg, player.implementation = "auto"
 default-members = ["crates/airplay-app"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/local/airplay2-rust"
+repository = "https://github.com/windowsedd/airplay2-rust"
 
 [workspace.dependencies]
 airplay-lib = { path = "crates/airplay-lib" }

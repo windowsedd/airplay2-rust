@@ -42,16 +42,28 @@ AI / coding agents:
 
 - Rust **1.70+** recommended (workspace uses edition 2021). Install via [rustup](https://rustup.rs/).
 
-### Default run (live window via **ffplay**)
+### Default run / build (player = **auto**)
 
-Plain **`cargo run`** does **not** need GStreamer. It uses **h264-dump + ffmpeg/ffplay** (install FFmpeg so `ffplay` is on `PATH`).
+Plain **`cargo run`** and the release **`.exe`** both default to **`player.implementation = "auto"`**:
+write `dump.h264` **and** open an **ffplay** window (install FFmpeg so `ffplay` is on `PATH`).  
+No GStreamer / pkg-config required.
 
 ```powershell
-# Windows (from repo root)
-.\run.ps1
-# or:
+cd F:\airplay2-rust
+
+# Dev (auto)
 cargo run
+
+# Release .exe into dist\ (auto)
+.\build-release.ps1
+.\dist\airplay-app.exe
+
+# Same as cargo run, with optional GStreamer:
+.\run.ps1
+.\run.ps1 -GStreamer
 ```
+
+You should see a log like: `player: auto (tee) — backends=h264-dump + ffmpeg/ffplay`.
 
 ### GStreamer build on Windows (optional)
 

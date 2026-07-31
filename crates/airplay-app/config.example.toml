@@ -2,11 +2,11 @@
 server_name = "airplay2-rust"
 width = 1280
 height = 720
-fps = 24
+fps = 30
+refresh_rate = 60
 
 [player]
-# auto = dump.h264 + ffplay + gstreamer (best chance of a live window)
+# auto = dump.h264 + ffplay window (default for cargo run and release .exe)
 # Also: gstreamer | ffmpeg | h264-dump | vlc
 implementation = "auto"
-# Used by h264-dump / auto tee
 output = "dump.h264"

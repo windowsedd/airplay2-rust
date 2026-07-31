@@ -157,7 +157,7 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         bail!("config file not found: {}", p.display());
     }
 
-    // Write a starter config so the next run finds it in CWD.
+    // Write starter config(s) so CWD and next-to-exe both default to auto.
     let starter = concat!(
         "[airplay]\n",
         "server_name = \"airplay2-rust\"\n",
@@ -167,17 +167,39 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         "refresh_rate = 60\n",
         "\n",
         "[player]\n",
-        "# auto = dump.h264 + ffplay window + GStreamer window\n",
+        "# auto = dump.h264 + ffplay window (+ gstreamer if this binary was built with it)\n",
         "implementation = \"auto\"\n",
         "output = \"dump.h264\"\n",
     );
-    if let Err(e) = std::fs::write("config.toml", starter) {
-        tracing::warn!(error = %e, "could not write config.toml; using in-memory defaults");
-    } else {
-        tracing::info!("wrote config.toml (player=auto — live window)");
+    let mut wrote_any = false;
+    for path in [
+        PathBuf::from("config.toml"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("config.toml")))
+            .unwrap_or_else(|| PathBuf::from("config.toml")),
+    ] {
+        if path.is_file() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                continue;
+            }
+        }
+        match std::fs::write(&path, starter) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "wrote config.toml (player=auto)");
+                wrote_any = true;
+            }
+            Err(e) => tracing::debug!(path = %path.display(), error = %e, "skip writing config"),
+        }
     }
-
-    tracing::info!("using defaults: player=auto (ffplay window + dump.h264; gstreamer if built with --features gstreamer)");
+    if !wrote_any {
+        tracing::info!("using in-memory defaults: player=auto");
+    } else {
+        tracing::info!("defaults: player=auto (ffplay window + dump.h264)");
+    }
     Ok(default_config())
 }
 
@@ -192,12 +214,17 @@ fn parse_args() -> Option<PathBuf> {
                 eprintln!(
                     "Usage: airplay-app [--config <path>]\n\n\
                      Starts an AirPlay 2 receiver.\n\
-                     Config: TOML with [airplay] and [player] sections (see config.example.toml).\n\n\
-                     Players (must be enabled at build time):\n\
-                       h264-dump  — write raw H.264 to a file (feature h264-dump, default)\n\
-                       gstreamer  — live window via GStreamer 1.x (feature gstreamer)\n\
-                       ffmpeg     — pipe H.264 to ffplay (feature ffmpeg)\n\
-                       vlc        — best-effort VLC stdin (feature vlc)"
+                     Default player: auto (dump.h264 + ffplay window).\n\n\
+                     Build / run:\n\
+                       cargo run\n\
+                       cargo build --release\n\
+                       .\\target\\release\\airplay-app.exe\n\n\
+                     Players (compile-time features):\n\
+                       auto       - dump + ffplay (+ gstreamer if built with feature)\n\
+                       h264-dump  - file only\n\
+                       ffmpeg     - ffplay window\n\
+                       gstreamer  - needs --features gstreamer + pkg-config on Windows\n\
+                       vlc        - needs --features vlc"
                 );
                 std::process::exit(0);
             }

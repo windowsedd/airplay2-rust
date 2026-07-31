@@ -3,7 +3,10 @@
 server_name = "airplay2-rust"
 width = 1280
 height = 720
-fps = 24
+# maxFPS advertised to the phone (cap). Phone still picks real FPS (often lower).
+# After changing fps: stop app, cargo run, then disconnect & re-mirror from the phone.
+fps = 30
+refresh_rate = 60
 
 [player]
 # auto = dump.h264 + ffplay + GStreamer windows titled "airplay2-rust"

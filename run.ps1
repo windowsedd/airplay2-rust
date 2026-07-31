@@ -1,10 +1,14 @@
 # airplay2-rust - Windows run helper
 #
-# Default (no GStreamer build tools):
+# Preferred (same as plain cargo run; player=auto):
+#   cargo run
 #   .\run.ps1
-#   -> cargo run with ffplay window + dump.h264
 #
-# With GStreamer live window (needs GStreamer MSVC + its pkg-config):
+# Release .exe into dist\:
+#   .\build-release.ps1
+#   .\dist\airplay-app.exe
+#
+# With GStreamer (needs GStreamer MSVC + pkg-config on PATH):
 #   .\run.ps1 -GStreamer
 #
 # Options:
