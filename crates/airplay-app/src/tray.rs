@@ -18,6 +18,10 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::WindowId;
 
+// Tray runs on a background thread while Tokio owns main; allow that on Windows.
+#[cfg(windows)]
+use winit::platform::windows::EventLoopBuilderExtWindows;
+
 /// Commands from the tray UI to the async main task.
 #[derive(Debug, Clone)]
 pub enum TrayCommand {
@@ -62,7 +66,25 @@ pub fn spawn_tray(info: TrayInfo) -> Result<(Receiver<TrayCommand>, JoinHandle<(
 }
 
 fn run_tray_event_loop(info: TrayInfo, cmd_tx: Sender<TrayCommand>) -> Result<(), String> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    // Tokio uses the main thread; tray must run off-main on Windows.
+    #[cfg(windows)]
+    {
+        builder.with_any_thread(true);
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        // Prefer any_thread if Wayland builder also needs it for off-main tray.
+        let _ = builder.with_any_thread(true);
+    }
+    let event_loop = builder
         .build()
         .map_err(|e| format!("event loop: {e}"))?;
 
