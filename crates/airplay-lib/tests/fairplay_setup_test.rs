@@ -111,8 +111,11 @@ fn fairplay_unsupported_version_errors() {
 }
 
 #[test]
-fn decrypt_aes_key_stub_not_implemented() {
+fn decrypt_aes_key_requires_key_msg() {
     let fp = FairPlay::new();
     let err = fp.decrypt_aes_key(&[0u8; 72]).unwrap_err();
-    assert!(err.to_string().contains("not implemented"));
+    assert!(
+        err.to_string().contains("key_msg"),
+        "unexpected error: {err}"
+    );
 }

@@ -119,8 +119,19 @@ impl FairPlay {
         self.key_msg.as_ref()
     }
 
-    /// Decrypt FairPlay AES key from `ekey` (requires OmgHax — Task 5–6).
-    pub fn decrypt_aes_key(&self, _ekey: &[u8]) -> Result<[u8; 16]> {
-        Err(AirPlayError::FairPlay("not implemented".into()))
+    /// Decrypt FairPlay AES key from `ekey` using stored `key_msg` (OmgHax).
+    pub fn decrypt_aes_key(&self, ekey: &[u8]) -> Result<[u8; 16]> {
+        let key_msg = self.key_msg.as_ref().ok_or_else(|| {
+            AirPlayError::FairPlay("key_msg not set; run fair_play_setup phase 2 first".into())
+        })?;
+        if ekey.len() < 72 {
+            return Err(AirPlayError::FairPlay(format!(
+                "ekey too short: {} (need >= 72)",
+                ekey.len()
+            )));
+        }
+        let mut aes_key = [0u8; 16];
+        crate::crypto::OmgHax::new().decrypt_aes_key(key_msg, ekey, &mut aes_key);
+        Ok(aes_key)
     }
 }

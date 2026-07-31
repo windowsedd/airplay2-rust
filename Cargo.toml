@@ -25,3 +25,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 bytes = "1"
+
+# FairPlay OmgHax/HandGarble relies on Java-style silent i32 wraparound.
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false

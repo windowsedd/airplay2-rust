@@ -1,6 +1,7 @@
 //! AirPlay protocol library: pairing, FairPlay, RTSP setup, decrypt, Bonjour helpers.
 
 pub mod airplay;
+pub mod crypto;
 pub mod error;
 pub mod fairplay;
 pub mod pairing;
