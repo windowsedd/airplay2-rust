@@ -59,22 +59,27 @@ pub fn prepare_info_response(config: &AirPlayConfig) -> Result<Vec<u8>, plist::E
         Value::Dictionary(audio_latency_101),
     ]);
 
+    // Clamp to a sane AirPlay range so bad config cannot advertise 0 / 1000 fps.
+    let max_fps = config.fps.clamp(1, 120);
+    let refresh = config.refresh_rate.clamp(1, 240);
+
     let mut display = Dictionary::new();
     display.insert("features".into(), int(14));
-    display.insert("height".into(), uint(u64::from(config.height)));
+    display.insert("height".into(), int(i64::from(config.height)));
     display.insert("heightPhysical".into(), Value::Boolean(false));
-    display.insert("heightPixels".into(), uint(u64::from(config.height)));
-    display.insert("maxFPS".into(), uint(u64::from(config.fps)));
+    display.insert("heightPixels".into(), int(i64::from(config.height)));
+    // Java uses integer maxFPS — keep signed Integer like dd-plist / Apple clients expect.
+    display.insert("maxFPS".into(), int(i64::from(max_fps)));
     display.insert("overscanned".into(), Value::Boolean(false));
-    display.insert("refreshRate".into(), int(60));
+    display.insert("refreshRate".into(), int(i64::from(refresh)));
     display.insert("rotation".into(), Value::Boolean(false));
     display.insert(
         "uuid".into(),
         Value::String("e5f7a68d-7b0f-4305-984b-974f677a150b".into()),
     );
-    display.insert("width".into(), uint(u64::from(config.width)));
+    display.insert("width".into(), int(i64::from(config.width)));
     display.insert("widthPhysical".into(), Value::Boolean(false));
-    display.insert("widthPixels".into(), uint(u64::from(config.width)));
+    display.insert("widthPixels".into(), int(i64::from(config.width)));
 
     let displays = Value::Array(vec![Value::Dictionary(display)]);
 

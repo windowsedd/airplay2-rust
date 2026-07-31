@@ -71,13 +71,13 @@ fn default_server_name() -> String {
     "airplay2-rust".into()
 }
 fn default_width() -> u32 {
-    1280
+    1920
 }
 fn default_height() -> u32 {
-    720
+    1080
 }
 fn default_fps() -> u32 {
-    30
+    60
 }
 fn default_refresh_rate() -> u32 {
     60
@@ -161,9 +161,10 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
     let starter = concat!(
         "[airplay]\n",
         "server_name = \"airplay2-rust\"\n",
-        "width = 1280\n",
-        "height = 720\n",
-        "fps = 30\n",
+        "# Quality: phone picks bitrate from advertised width/height/maxFPS (no bitrate key).\n",
+        "width = 1920\n",
+        "height = 1080\n",
+        "fps = 60\n",
         "refresh_rate = 60\n",
         "\n",
         "[player]\n",
@@ -399,7 +400,7 @@ async fn main() -> Result<()> {
         height = server_cfg.height,
         max_fps = server_cfg.fps,
         refresh_rate = server_cfg.refresh_rate,
-        "advertising display to iPhone (maxFPS is a cap — phone chooses actual rate)"
+        "advertising display to iPhone (resolution drives quality; bitrate is chosen by the phone)"
     );
 
     let implementation = resolve_implementation(&cfg.player.implementation);

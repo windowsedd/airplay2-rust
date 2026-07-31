@@ -1,15 +1,23 @@
 [airplay]
 # Name shown on the iPhone Screen Mirroring list
 server_name = "airplay2-rust"
-width = 1280
-height = 720
-# maxFPS advertised to the phone (cap). Phone still picks real FPS (often lower).
-# After changing fps: stop app, cargo run, then disconnect & re-mirror from the phone.
-fps = 30
+
+# --- Quality (no separate "bitrate" on the receiver) ---
+# The iPhone encodes H.264 based on what we advertise here:
+#   larger width/height  => typically higher bitrate / sharper picture
+#   higher fps           => smoother motion (up to what Wi-Fi allows)
+# After changing these: stop the app, restart, then disconnect & re-mirror on the phone.
+width = 1920
+height = 1080
+fps = 60
 refresh_rate = 60
 
+# Lower quality / less Wi-Fi load (uncomment if stream is choppy):
+# width = 1280
+# height = 720
+# fps = 30
+
 [player]
-# auto = dump.h264 + ffplay + GStreamer windows titled "airplay2-rust"
-# PC volume (GStreamer): console keys +/= - m 0-9  (does NOT change phone volume)
+# auto = dump.h264 + ffplay window
 implementation = "auto"
 output = "dump.h264"
