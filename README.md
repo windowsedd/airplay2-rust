@@ -73,6 +73,20 @@ cargo run
 
 You should see a log like: `player: auto (tee) — backends=h264-dump + ffmpeg/ffplay`.
 
+### System tray (taskbar)
+
+While running, look for the **orange circle** tray icon (notification area). Right‑click:
+
+| Menu | Action |
+|------|--------|
+| **Status / About** | Server name, port, player, resolution (also double‑click icon) |
+| **Open config.toml** | Edit settings in your default editor |
+| **Open dump folder** | Folder containing `dump.h264` |
+| **Open install folder** | Folder of the `.exe` |
+| **Exit** | Stop the receiver cleanly |
+
+Also works with `Ctrl+C` in the console.
+
 ### GStreamer build on Windows (optional)
 
 Rust’s `gstreamer` crates need **`pkg-config.exe`** (ships in GStreamer `bin`) **and** `PKG_CONFIG_PATH`:

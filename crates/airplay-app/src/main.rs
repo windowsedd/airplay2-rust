@@ -1,10 +1,13 @@
 //! Runnable AirPlay receiver binary.
 //!
 //! Loads TOML config, starts `AirPlayServer` with the selected player backend,
-//! and shuts down cleanly on Ctrl+C.
+//! system tray menu (Exit / Open config / dump folder / Status), and shuts down
+//! cleanly on Ctrl+C or tray Exit.
 //!
 //! Player backends are selected by `player.implementation` and must be compiled
 //! in via Cargo features (`h264-dump`, `gstreamer`, `ffmpeg`, `vlc`).
+
+mod tray;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,12 +113,12 @@ fn default_config() -> AppConfig {
     }
 }
 
-fn load_config(path: Option<&Path>) -> Result<AppConfig> {
+/// Returns `(config, path of config.toml used or written)`.
+fn load_config(path: Option<&Path>) -> Result<(AppConfig, PathBuf)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = path {
         candidates.push(p.to_path_buf());
     } else {
-        // CWD first, then next to the running binary (so double-click / other cwd still works).
         candidates.push(PathBuf::from("config.toml"));
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -132,7 +135,6 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
                 .with_context(|| format!("read config {}", candidate.display()))?;
             let mut cfg: AppConfig = toml::from_str(&text)
                 .with_context(|| format!("parse config {}", candidate.display()))?;
-            // Old configs that still say h264-dump → upgrade to auto (live window).
             let impl_key = cfg.player.implementation.to_ascii_lowercase();
             if matches!(impl_key.as_str(), "h264-dump" | "h264_dump" | "dump") {
                 tracing::warn!(
@@ -149,7 +151,7 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
                 player = %cfg.player.implementation,
                 "loaded config"
             );
-            return Ok(cfg);
+            return Ok((cfg, candidate.clone()));
         }
     }
 
@@ -157,22 +159,19 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         bail!("config file not found: {}", p.display());
     }
 
-    // Write starter config(s) so CWD and next-to-exe both default to auto.
     let starter = concat!(
         "[airplay]\n",
         "server_name = \"airplay2-rust\"\n",
-        "# Quality: phone picks bitrate from advertised width/height/maxFPS (no bitrate key).\n",
         "width = 1920\n",
         "height = 1080\n",
         "fps = 60\n",
         "refresh_rate = 60\n",
         "\n",
         "[player]\n",
-        "# auto = dump.h264 + ffplay window (+ gstreamer if this binary was built with it)\n",
         "implementation = \"auto\"\n",
         "output = \"dump.h264\"\n",
     );
-    let mut wrote_any = false;
+    let mut used = PathBuf::from("config.toml");
     for path in [
         PathBuf::from("config.toml"),
         std::env::current_exe()
@@ -181,27 +180,22 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
             .unwrap_or_else(|| PathBuf::from("config.toml")),
     ] {
         if path.is_file() {
-            continue;
+            used = path;
+            break;
         }
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 continue;
             }
         }
-        match std::fs::write(&path, starter) {
-            Ok(()) => {
-                tracing::info!(path = %path.display(), "wrote config.toml (player=auto)");
-                wrote_any = true;
-            }
-            Err(e) => tracing::debug!(path = %path.display(), error = %e, "skip writing config"),
+        if std::fs::write(&path, starter).is_ok() {
+            tracing::info!(path = %path.display(), "wrote config.toml (player=auto)");
+            used = path;
+            break;
         }
     }
-    if !wrote_any {
-        tracing::info!("using in-memory defaults: player=auto");
-    } else {
-        tracing::info!("defaults: player=auto (ffplay window + dump.h264)");
-    }
-    Ok(default_config())
+    tracing::info!("defaults: player=auto");
+    Ok((default_config(), used))
 }
 
 fn parse_args() -> Option<PathBuf> {
@@ -377,8 +371,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = parse_args();
-    let cfg = load_config(config_path.as_deref())?;
+    let config_path_arg = parse_args();
+    let (cfg, config_path) = load_config(config_path_arg.as_deref())?;
 
     let fps = cfg.airplay.fps.clamp(1, 120);
     let refresh_rate = cfg.airplay.refresh_rate.clamp(1, 240);
@@ -404,6 +398,7 @@ async fn main() -> Result<()> {
     );
 
     let implementation = resolve_implementation(&cfg.player.implementation);
+    let dump_path = PathBuf::from(&cfg.player.output);
     let consumer = build_consumer(&implementation, &cfg.player.output).with_context(|| {
         format!(
             "failed to start player '{implementation}'. \
@@ -415,19 +410,59 @@ async fn main() -> Result<()> {
     let mut server = AirPlayServer::new(server_cfg, consumer);
     server.start().await.context("start AirPlay server")?;
 
+    let port = server.port();
     tracing::info!(
         name = %cfg.airplay.server_name,
-        port = server.port(),
+        port,
         player = %implementation,
         max_fps = fps,
-        "AirPlay receiver running — reconnect Screen Mirroring after changing fps"
+        "AirPlay receiver running — tray icon available; Ctrl+C or tray Exit to stop"
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("wait for Ctrl+C")?;
+    let tray_info = tray::TrayInfo {
+        server_name: cfg.airplay.server_name.clone(),
+        port,
+        player: implementation.clone(),
+        width: cfg.airplay.width,
+        height: cfg.airplay.height,
+        fps,
+        config_path: config_path.clone(),
+        dump_path: dump_path.clone(),
+    };
 
-    tracing::info!("Ctrl+C received; shutting down");
+    // System tray (taskbar). Soft-fail if tray cannot start (headless / no GUI).
+    let tray_rx = match tray::spawn_tray(tray_info.clone()) {
+        Ok((rx, _handle)) => Some(rx),
+        Err(e) => {
+            tracing::warn!(error = %e, "system tray unavailable; use Ctrl+C to exit");
+            None
+        }
+    };
+
+    // Wait for Ctrl+C or tray Exit (poll tray so we can open config without blocking).
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl+C received; shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                if let Some(rx) = tray_rx.as_ref() {
+                    while let Ok(cmd) = rx.try_recv() {
+                        match cmd {
+                            tray::TrayCommand::Quit => {
+                                tracing::info!("tray Exit; shutting down");
+                                server.stop().await;
+                                return Ok(());
+                            }
+                            other => tray::handle_tray_command(other, &tray_info),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     server.stop().await;
     Ok(())
 }

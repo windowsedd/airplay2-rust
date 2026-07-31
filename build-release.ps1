@@ -35,6 +35,16 @@ $dist = Join-Path $PSScriptRoot "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Copy-Item "target\release\airplay-app.exe" (Join-Path $dist "airplay-app.exe") -Force
 
+# Tray icon (optional; binary has a fallback icon if missing)
+$assetsDist = Join-Path $dist "assets"
+New-Item -ItemType Directory -Force -Path $assetsDist | Out-Null
+if (Test-Path "assets\tray-icon.png") {
+    Copy-Item "assets\tray-icon.png" (Join-Path $assetsDist "tray-icon.png") -Force
+}
+if (Test-Path "assets\logo.png") {
+    Copy-Item "assets\logo.png" (Join-Path $assetsDist "logo.png") -Force
+}
+
 $configSrc = Join-Path $PSScriptRoot "config.toml"
 $configDst = Join-Path $dist "config.toml"
 if (Test-Path $configSrc) {
