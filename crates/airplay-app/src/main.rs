@@ -2,11 +2,13 @@
 //!
 //! Loads TOML config, starts `AirPlayServer` with the selected player backend,
 //! and shuts down cleanly on Ctrl+C.
+//!
+//! Player backends are selected by `player.implementation` and must be compiled
+//! in via Cargo features (`h264-dump`, `gstreamer`, `ffmpeg`, `vlc`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use airplay_player::H264Dump;
 use airplay_server::{AirPlayConfig, AirPlayServer};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -122,8 +124,13 @@ fn parse_args() -> Option<PathBuf> {
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: airplay-app [--config <path>]\n\n\
-                     Starts an AirPlay 2 receiver. Default player writes raw H.264 to dump.h264.\n\
-                     Config: TOML with [airplay] and [player] sections (see config.example.toml)."
+                     Starts an AirPlay 2 receiver.\n\
+                     Config: TOML with [airplay] and [player] sections (see config.example.toml).\n\n\
+                     Players (must be enabled at build time):\n\
+                       h264-dump  — write raw H.264 to a file (feature h264-dump, default)\n\
+                       gstreamer  — live window via GStreamer 1.x (feature gstreamer)\n\
+                       ffmpeg     — pipe H.264 to ffplay (feature ffmpeg)\n\
+                       vlc        — best-effort VLC stdin (feature vlc)"
                 );
                 std::process::exit(0);
             }
@@ -138,6 +145,81 @@ fn parse_args() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn missing_feature_msg(name: &str, feature: &str) -> String {
+    format!(
+        "player implementation '{name}' requires building with --features {feature}\n\
+         Example: cargo run -p airplay-app --features {feature}\n\
+         See README for install notes (GStreamer / FFmpeg / VLC)."
+    )
+}
+
+fn build_consumer(
+    implementation: &str,
+    output: &str,
+) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
+    let impl_key = implementation.to_ascii_lowercase();
+    match impl_key.as_str() {
+        "h264-dump" | "h264_dump" | "dump" => {
+            #[cfg(feature = "h264-dump")]
+            {
+                let dump = airplay_player::H264Dump::new(output)
+                    .with_context(|| format!("open H.264 dump {output}"))?;
+                tracing::info!(output = %output, "player: h264-dump");
+                Ok(Arc::new(dump))
+            }
+            #[cfg(not(feature = "h264-dump"))]
+            {
+                bail!("{}", missing_feature_msg(implementation, "h264-dump"));
+            }
+        }
+        "gstreamer" | "gst" => {
+            #[cfg(feature = "gstreamer")]
+            {
+                let player = airplay_player::GStreamerPlayer::new()
+                    .map_err(|e| anyhow::anyhow!("GStreamer player: {e}"))?;
+                tracing::info!("player: gstreamer");
+                Ok(Arc::new(player))
+            }
+            #[cfg(not(feature = "gstreamer"))]
+            {
+                bail!("{}", missing_feature_msg(implementation, "gstreamer"));
+            }
+        }
+        "ffmpeg" | "ffplay" => {
+            #[cfg(feature = "ffmpeg")]
+            {
+                let player = airplay_player::FFmpegPlayer::new()
+                    .map_err(|e| anyhow::anyhow!("FFmpeg player: {e}"))?;
+                tracing::info!("player: ffmpeg (ffplay)");
+                Ok(Arc::new(player))
+            }
+            #[cfg(not(feature = "ffmpeg"))]
+            {
+                bail!("{}", missing_feature_msg(implementation, "ffmpeg"));
+            }
+        }
+        "vlc" => {
+            #[cfg(feature = "vlc")]
+            {
+                let player = airplay_player::VlcPlayer::new()
+                    .map_err(|e| anyhow::anyhow!("VLC player: {e}"))?;
+                tracing::info!("player: vlc (best-effort)");
+                Ok(Arc::new(player))
+            }
+            #[cfg(not(feature = "vlc"))]
+            {
+                bail!("{}", missing_feature_msg(implementation, "vlc"));
+            }
+        }
+        other => {
+            bail!(
+                "unsupported player implementation '{other}' \
+                 (supported: h264-dump, gstreamer, ffmpeg, vlc)"
+            );
+        }
+    }
 }
 
 #[tokio::main]
@@ -158,23 +240,7 @@ async fn main() -> Result<()> {
         fps: cfg.airplay.fps,
     };
 
-    let implementation = cfg.player.implementation.to_ascii_lowercase();
-    let consumer: Arc<dyn airplay_server::AirPlayConsumer> = match implementation.as_str() {
-        "h264-dump" | "h264_dump" | "dump" => {
-            let dump = H264Dump::new(&cfg.player.output)
-                .with_context(|| format!("open H.264 dump {}", cfg.player.output))?;
-            tracing::info!(
-                output = %cfg.player.output,
-                "player: h264-dump"
-            );
-            Arc::new(dump)
-        }
-        other => {
-            bail!(
-                "unsupported player implementation '{other}' (supported: h264-dump)"
-            );
-        }
-    };
+    let consumer = build_consumer(&cfg.player.implementation, &cfg.player.output)?;
 
     let mut server = AirPlayServer::new(server_cfg, consumer);
     server.start().await.context("start AirPlay server")?;

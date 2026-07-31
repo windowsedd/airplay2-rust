@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["h264-dump"]
 h264-dump = []
-gstreamer = []
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
 ffmpeg = []
 vlc = []
 
@@ -15,3 +15,5 @@ vlc = []
 airplay-lib = { workspace = true }
 airplay-server = { workspace = true }
 tracing = { workspace = true }
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }

@@ -8,9 +8,16 @@ license.workspace = true
 name = "airplay-app"
 path = "src/main.rs"
 
+[features]
+default = ["h264-dump"]
+h264-dump = ["airplay-player/h264-dump"]
+gstreamer = ["airplay-player/gstreamer"]
+ffmpeg = ["airplay-player/ffmpeg"]
+vlc = ["airplay-player/vlc"]
+
 [dependencies]
 airplay-server = { workspace = true }
-airplay-player = { workspace = true, features = ["h264-dump"] }
+airplay-player = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -17,7 +17,7 @@ repository = "https://github.com/local/airplay2-rust"
 [workspace.dependencies]
 airplay-lib = { path = "crates/airplay-lib" }
 airplay-server = { path = "crates/airplay-server" }
-airplay-player = { path = "crates/airplay-player" }
+airplay-player = { path = "crates/airplay-player", default-features = false }
 airplay-client = { path = "crates/airplay-client" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

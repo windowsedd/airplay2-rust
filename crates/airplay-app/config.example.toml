@@ -5,6 +5,9 @@ height = 720
 fps = 24
 
 [player]
-# gstreamer | ffmpeg | vlc | h264-dump
+# h264-dump | gstreamer | ffmpeg | vlc
+# Build with matching Cargo feature, e.g.:
+#   cargo run -p airplay-app --features gstreamer
 implementation = "h264-dump"
+# Used by h264-dump only
 output = "dump.h264"
