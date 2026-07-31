@@ -75,7 +75,6 @@ name = "airplay-server"
 version = "0.1.0"
 dependencies = [
  "airplay-lib",
- "bytes",
  "plist",
  "thiserror",
  "tokio",

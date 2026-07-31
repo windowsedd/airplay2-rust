@@ -90,8 +90,7 @@ impl AirPlayServer {
             let _ = handle.await;
         }
 
-        // Tear down any placeholder media tasks.
-        // SessionManager has no clear-all; leave sessions until drop.
+        // Media tasks live on sessions; they abort when sessions drop / TEARDOWN.
         info!("AirPlay control server stopped");
     }
 }

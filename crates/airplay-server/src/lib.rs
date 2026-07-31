@@ -3,6 +3,8 @@
 pub mod config;
 pub mod consumer;
 pub mod control;
+pub mod media;
+pub mod packet;
 pub mod plist_util;
 pub mod server;
 pub mod session;

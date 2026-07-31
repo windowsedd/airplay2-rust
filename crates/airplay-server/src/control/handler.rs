@@ -3,13 +3,12 @@
 use std::sync::Arc;
 
 use airplay_lib::MediaStreamInfo;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 use crate::config::AirPlayConfig;
 use crate::consumer::AirPlayConsumer;
 use crate::control::codec::{ControlRequest, ControlResponse};
+use crate::media;
 use crate::plist_util;
 use crate::session::SessionManager;
 
@@ -136,9 +135,9 @@ impl ControlHandler {
 
     fn handle_pair_setup(&self, request: &ControlRequest) -> ControlResponse {
         let sid = request.session_id().to_string();
-        let pk = self
-            .sessions
-            .with_session(&sid, |s| s.airplay.pair_setup());
+        let pk = self.sessions.with_session(&sid, |s| {
+            s.airplay.lock().expect("airplay lock").pair_setup()
+        });
         ControlResponse::ok_rtsp()
             .with_cseq_from(request)
             .with_body(pk.to_vec())
@@ -146,9 +145,12 @@ impl ControlHandler {
 
     fn handle_pair_verify(&self, request: &ControlRequest) -> ControlResponse {
         let sid = request.session_id().to_string();
-        let result = self
-            .sessions
-            .with_session(&sid, |s| s.airplay.pair_verify(&request.body));
+        let result = self.sessions.with_session(&sid, |s| {
+            s.airplay
+                .lock()
+                .expect("airplay lock")
+                .pair_verify(&request.body)
+        });
         match result {
             Ok(body) => ControlResponse::ok_rtsp()
                 .with_cseq_from(request)
@@ -162,9 +164,12 @@ impl ControlHandler {
 
     fn handle_fp_setup(&self, request: &ControlRequest) -> ControlResponse {
         let sid = request.session_id().to_string();
-        let result = self
-            .sessions
-            .with_session(&sid, |s| s.airplay.fair_play_setup(&request.body));
+        let result = self.sessions.with_session(&sid, |s| {
+            s.airplay
+                .lock()
+                .expect("airplay lock")
+                .fair_play_setup(&request.body)
+        });
         match result {
             Ok(body) => ControlResponse::ok_rtsp()
                 .with_cseq_from(request)
@@ -178,11 +183,14 @@ impl ControlHandler {
 
     async fn handle_setup(&self, request: &ControlRequest) -> ControlResponse {
         let sid = request.session_id().to_string();
-        let setup_result = self
-            .sessions
-            .with_session(&sid, |s| s.airplay.rtsp_setup(&request.body));
+        let setup_result = self.sessions.with_session(&sid, |s| {
+            s.airplay
+                .lock()
+                .expect("airplay lock")
+                .rtsp_setup(&request.body)
+        });
 
-        let media = match setup_result {
+        let media_info = match setup_result {
             Ok(m) => m,
             Err(e) => {
                 warn!(session = %sid, "rtsp_setup failed: {e}");
@@ -190,16 +198,21 @@ impl ControlHandler {
             }
         };
 
-        match media {
+        match media_info {
             None => {
                 // ekey/eiv only — empty body OK.
                 ok_rtsp(request)
             }
             Some(MediaStreamInfo::Video(info)) => {
                 self.consumer.on_video_format(&info);
-                match bind_placeholder_tcp().await {
+                match media::video::bind().await {
                     Ok((listener, port)) => {
-                        let handle = spawn_tcp_discard(listener);
+                        let (airplay, consumer) = (
+                            self.sessions
+                                .with_session(&sid, |s| Arc::clone(&s.airplay)),
+                            Arc::clone(&self.consumer),
+                        );
+                        let handle = media::video::run_accept(listener, airplay, consumer);
                         self.sessions.with_session(&sid, |s| {
                             if let Some(old) = s.video_task.take() {
                                 old.abort();
@@ -207,7 +220,7 @@ impl ControlHandler {
                             s.video_port = Some(port);
                             s.video_task = Some(handle);
                         });
-                        info!(session = %sid, port, "video SETUP bound placeholder port");
+                        info!(session = %sid, port, "video SETUP bound media port");
                         match plist_util::prepare_setup_video_response(
                             port,
                             self.control_port,
@@ -231,12 +244,17 @@ impl ControlHandler {
             }
             Some(MediaStreamInfo::Audio(info)) => {
                 self.consumer.on_audio_format(&info);
-                let data = bind_placeholder_tcp().await;
-                let control = bind_placeholder_tcp().await;
+                let data = media::audio::bind().await;
+                let control = media::audio_control::bind().await;
                 match (data, control) {
-                    (Ok((data_l, data_port)), Ok((ctrl_l, ctrl_port))) => {
-                        let data_handle = spawn_tcp_discard(data_l);
-                        let ctrl_handle = spawn_tcp_discard(ctrl_l);
+                    (Ok((data_sock, data_port)), Ok((ctrl_sock, ctrl_port))) => {
+                        let airplay = self
+                            .sessions
+                            .with_session(&sid, |s| Arc::clone(&s.airplay));
+                        let consumer = Arc::clone(&self.consumer);
+                        let data_handle =
+                            media::audio::run_recv(data_sock, airplay, consumer);
+                        let ctrl_handle = media::audio_control::run_recv(ctrl_sock);
                         self.sessions.with_session(&sid, |s| {
                             if let Some(old) = s.audio_task.take() {
                                 old.abort();
@@ -253,7 +271,7 @@ impl ControlHandler {
                             session = %sid,
                             data_port,
                             ctrl_port,
-                            "audio SETUP bound placeholder ports"
+                            "audio SETUP bound media ports"
                         );
                         match plist_util::prepare_setup_audio_response(data_port, ctrl_port) {
                             Ok(body) => ControlResponse::ok_rtsp()
@@ -277,11 +295,14 @@ impl ControlHandler {
 
     fn handle_teardown(&self, request: &ControlRequest) -> ControlResponse {
         let sid = request.session_id().to_string();
-        let media = self
-            .sessions
-            .with_session(&sid, |s| s.airplay.rtsp_teardown(&request.body));
+        let media_info = self.sessions.with_session(&sid, |s| {
+            s.airplay
+                .lock()
+                .expect("airplay lock")
+                .rtsp_teardown(&request.body)
+        });
 
-        match media {
+        match media_info {
             Ok(Some(MediaStreamInfo::Audio(_))) => {
                 self.consumer.on_audio_src_disconnect();
                 self.sessions.with_session(&sid, |s| {
@@ -359,37 +380,4 @@ impl ControlHandler {
 
 fn ok_rtsp(request: &ControlRequest) -> ControlResponse {
     ControlResponse::ok_rtsp().with_cseq_from(request)
-}
-
-async fn bind_placeholder_tcp() -> std::io::Result<(TcpListener, u16)> {
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
-    let port = listener.local_addr()?.port();
-    Ok((listener, port))
-}
-
-/// Accept connections and discard all data until the listener is dropped/aborted.
-fn spawn_tcp_discard(listener: TcpListener) -> tokio::task::AbortHandle {
-    let join = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, peer)) => {
-                    debug!(%peer, "placeholder media accept (discard)");
-                    tokio::spawn(async move {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {
-                                    // discard until Task 10
-                                }
-                            }
-                        }
-                        let _ = stream.shutdown().await;
-                    });
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    join.abort_handle()
 }
