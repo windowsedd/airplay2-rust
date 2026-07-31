@@ -40,9 +40,17 @@ dependencies = [
 name = "airplay-client"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "airplay-lib",
+ "ctr",
+ "ed25519-dalek",
+ "mdns-sd",
+ "rand_core",
+ "sha2",
+ "thiserror",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]
