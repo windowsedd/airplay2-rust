@@ -1,0 +1,10 @@
+[airplay]
+server_name = "airplay2-rust"
+width = 1280
+height = 720
+fps = 24
+
+[player]
+# gstreamer | ffmpeg | vlc | h264-dump
+implementation = "h264-dump"
+output = "dump.h264"

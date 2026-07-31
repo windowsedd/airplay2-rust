@@ -12,5 +12,6 @@ ffmpeg = []
 vlc = []
 
 [dependencies]
+airplay-lib = { workspace = true }
 airplay-server = { workspace = true }
 tracing = { workspace = true }
