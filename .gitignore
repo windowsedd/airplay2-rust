@@ -1,0 +1,7 @@
+﻿.worktrees/
+target/
+**/*.rs.bk
+.idea/
+.vscode/
+*.h264
+dump.h264
