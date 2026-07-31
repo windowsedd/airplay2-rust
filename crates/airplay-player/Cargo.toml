@@ -1,0 +1,16 @@
+[package]
+name = "airplay-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["h264-dump"]
+h264-dump = []
+gstreamer = []
+ffmpeg = []
+vlc = []
+
+[dependencies]
+airplay-server = { workspace = true }
+tracing = { workspace = true }

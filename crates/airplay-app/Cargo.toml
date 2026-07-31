@@ -1,0 +1,17 @@
+[package]
+name = "airplay-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "airplay-app"
+path = "src/main.rs"
+
+[dependencies]
+airplay-server = { workspace = true }
+airplay-player = { workspace = true, features = ["h264-dump"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

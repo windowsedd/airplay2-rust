@@ -1,0 +1,10 @@
+[package]
+name = "airplay-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+airplay-lib = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
