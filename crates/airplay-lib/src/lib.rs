@@ -1,6 +1,7 @@
 //! AirPlay protocol library: pairing, FairPlay, RTSP setup, decrypt, Bonjour helpers.
 
 pub mod airplay;
+pub mod bonjour;
 pub mod crypto;
 pub mod decrypt;
 pub mod error;
@@ -10,6 +11,10 @@ pub mod rtsp;
 pub mod stream_info;
 
 pub use airplay::AirPlay;
+pub use bonjour::{
+    airplay_txt_records, format_mac, raop_service_name, raop_txt_records, AirPlayBonjour,
+    AIRPLAY_FEATURES, AIRPLAY_PK, AIRPLAY_SRCVERS,
+};
 pub use decrypt::{FairPlayAudioDecryptor, FairPlayVideoDecryptor};
 pub use error::{AirPlayError, Result};
 pub use fairplay::FairPlay;

@@ -16,6 +16,8 @@ pub enum AirPlayError {
     Crypto(String),
     #[error("invalid state: {0}")]
     InvalidState(String),
+    #[error("bonjour/mDNS error: {0}")]
+    Bonjour(String),
 }
 
 pub type Result<T> = std::result::Result<T, AirPlayError>;
