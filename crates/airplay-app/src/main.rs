@@ -92,24 +92,55 @@ fn default_output() -> String {
     "dump.h264".into()
 }
 
+fn default_config() -> AppConfig {
+    AppConfig {
+        airplay: AirplaySection::default(),
+        player: PlayerSection {
+            implementation: "auto".into(),
+            output: "dump.h264".into(),
+        },
+    }
+}
+
 fn load_config(path: Option<&Path>) -> Result<AppConfig> {
-    let candidates: Vec<PathBuf> = if let Some(p) = path {
-        vec![p.to_path_buf()]
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = path {
+        candidates.push(p.to_path_buf());
     } else {
-        vec![
-            PathBuf::from("config.toml"),
-            PathBuf::from("crates/airplay-app/config.example.toml"),
-            PathBuf::from("config.example.toml"),
-        ]
-    };
+        // CWD first, then next to the running binary (so double-click / other cwd still works).
+        candidates.push(PathBuf::from("config.toml"));
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("config.toml"));
+            }
+        }
+        candidates.push(PathBuf::from("crates/airplay-app/config.example.toml"));
+        candidates.push(PathBuf::from("config.example.toml"));
+    }
 
     for candidate in &candidates {
         if candidate.is_file() {
             let text = std::fs::read_to_string(candidate)
                 .with_context(|| format!("read config {}", candidate.display()))?;
-            let cfg: AppConfig = toml::from_str(&text)
+            let mut cfg: AppConfig = toml::from_str(&text)
                 .with_context(|| format!("parse config {}", candidate.display()))?;
-            tracing::info!(path = %candidate.display(), "loaded config");
+            // Old configs that still say h264-dump → upgrade to auto (live window).
+            let impl_key = cfg.player.implementation.to_ascii_lowercase();
+            if matches!(impl_key.as_str(), "h264-dump" | "h264_dump" | "dump") {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    "config player is h264-dump (file only); switching to auto for a live window. \
+                     Set AIRPLAY_FORCE_DUMP=1 to keep dump-only."
+                );
+                if std::env::var_os("AIRPLAY_FORCE_DUMP").is_none() {
+                    cfg.player.implementation = "auto".into();
+                }
+            }
+            tracing::info!(
+                path = %candidate.display(),
+                player = %cfg.player.implementation,
+                "loaded config"
+            );
             return Ok(cfg);
         }
     }
@@ -118,11 +149,27 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         bail!("config file not found: {}", p.display());
     }
 
-    tracing::warn!("no config.toml found; using defaults (h264-dump → dump.h264)");
-    Ok(AppConfig {
-        airplay: AirplaySection::default(),
-        player: PlayerSection::default(),
-    })
+    // Write a starter config so the next run finds it in CWD.
+    let starter = concat!(
+        "[airplay]\n",
+        "server_name = \"airplay2-rust\"\n",
+        "width = 1280\n",
+        "height = 720\n",
+        "fps = 24\n",
+        "\n",
+        "[player]\n",
+        "# auto = dump.h264 + ffplay window + GStreamer window\n",
+        "implementation = \"auto\"\n",
+        "output = \"dump.h264\"\n",
+    );
+    if let Err(e) = std::fs::write("config.toml", starter) {
+        tracing::warn!(error = %e, "could not write config.toml; using in-memory defaults");
+    } else {
+        tracing::info!("wrote config.toml (player=auto — live window)");
+    }
+
+    tracing::info!("using defaults: player=auto (ffplay + gstreamer + dump.h264)");
+    Ok(default_config())
 }
 
 fn parse_args() -> Option<PathBuf> {
