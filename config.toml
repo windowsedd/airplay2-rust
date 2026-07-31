@@ -1,11 +1,12 @@
 [airplay]
+# Name shown on the iPhone Screen Mirroring list
 server_name = "airplay2-rust"
 width = 1280
 height = 720
 fps = 24
 
 [player]
-# auto = dump.h264 + ffplay window + GStreamer window (DEFAULT — shows a window)
-# Also: gstreamer | ffmpeg | h264-dump | vlc
+# auto = dump.h264 + ffplay + GStreamer windows titled "airplay2-rust"
+# PC volume (GStreamer): console keys +/= - m 0-9  (does NOT change phone volume)
 implementation = "auto"
 output = "dump.h264"

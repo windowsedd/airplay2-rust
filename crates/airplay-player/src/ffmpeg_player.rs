@@ -33,7 +33,7 @@ impl FFmpegPlayer {
         let mut child = Command::new("ffplay")
             .args([
                 "-window_title",
-                "airplay2-rust",
+                "airplay2-rust", // match GStreamer window name
                 "-fflags",
                 "nobuffer+discardcorrupt",
                 "-flags",
