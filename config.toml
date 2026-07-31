@@ -1,0 +1,10 @@
+[airplay]
+server_name = "airplay2-rust"
+width = 1280
+height = 720
+fps = 24
+
+[player]
+# Live video window via GStreamer (must build with --features gstreamer)
+implementation = "gstreamer"
+output = "dump.h264"

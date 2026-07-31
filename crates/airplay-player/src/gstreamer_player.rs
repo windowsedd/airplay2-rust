@@ -2,14 +2,20 @@
 //!
 //! Requires system GStreamer 1.x and Cargo feature `gstreamer`.
 //! Pipeline (H.264 annex-B / byte-stream):
-//! `appsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink`
+//! `appsrc ! queue ! h264parse ! avdec_h264 ! videoconvert ! autovideosink`
+//!
+//! A GLib main loop runs on a background thread so Windows/Linux video sinks
+//! can create and update the playback window.
 
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use airplay_lib::{AudioStreamInfo, CompressionType, VideoStreamInfo};
 use airplay_server::{AirPlayConsumer, PlaybackInfo};
 use gstreamer as gst;
+use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
@@ -23,6 +29,9 @@ pub struct GStreamerPlayer {
     aac_eld_src: Mutex<gst_app::AppSrc>,
     audio_compression: Mutex<Option<CompressionType>>,
     hls_pipeline: Mutex<Option<gst::Pipeline>>,
+    /// Keep main-loop thread alive for the lifetime of the player.
+    _main_loop_thread: Option<JoinHandle<()>>,
+    main_loop_quit: Arc<AtomicBool>,
 }
 
 impl GStreamerPlayer {
@@ -30,13 +39,41 @@ impl GStreamerPlayer {
     pub fn new() -> Result<Self, String> {
         gst::init().map_err(|e| format!("gstreamer init failed: {e}"))?;
 
+        // GLib main loop is required for autovideosink window creation on Windows.
+        let main_loop_quit = Arc::new(AtomicBool::new(false));
+        let quit_flag = Arc::clone(&main_loop_quit);
+        let main_loop_thread = thread::Builder::new()
+            .name("gstreamer-main-loop".into())
+            .spawn(move || {
+                let main_context = glib::MainContext::default();
+                let _guard = main_context.acquire().expect("acquire GLib main context");
+                while !quit_flag.load(Ordering::Relaxed) {
+                    // Pump pending events; short timeout so we can exit promptly.
+                    let _ = main_context.iteration(false);
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+            .map_err(|e| format!("spawn gstreamer main loop: {e}"))?;
+
+        // queue isolates appsrc push thread from the decode/display chain.
         let h264_pipeline = gst::parse::launch(
-            "appsrc name=video_src is-live=true format=time \
-             ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false",
+            "appsrc name=video_src is-live=true format=time do-timestamp=true \
+             ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 \
+             ! h264parse \
+             ! avdec_h264 \
+             ! videoconvert \
+             ! autovideosink name=videosink sync=false",
         )
         .map_err(|e| format!("parse H.264 pipeline: {e}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "H.264 launch result is not a Pipeline".to_string())?;
+
+        // Prefer a titled window when the sink supports it.
+        if let Some(sink) = h264_pipeline.by_name("videosink") {
+            if sink.find_property("title").is_some() {
+                sink.set_property_from_str("title", "airplay2-rust");
+            }
+        }
 
         let h264_src = h264_pipeline
             .by_name("video_src")
@@ -46,17 +83,20 @@ impl GStreamerPlayer {
 
         h264_src.set_caps(Some(
             &gst::Caps::from_str(
-                "video/x-h264,colorimetry=bt709,stream-format=(string)byte-stream,alignment=(string)au",
+                "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au",
             )
             .map_err(|e| format!("H.264 caps: {e}"))?,
         ));
         h264_src.set_format(gst::Format::Time);
         h264_src.set_is_live(true);
         h264_src.set_stream_type(gst_app::AppStreamType::Stream);
+        // Avoid blocking the media thread if the sink is slow.
+        h264_src.set_property("block", false);
+        h264_src.set_max_bytes(8 * 1024 * 1024);
 
         let alac_pipeline = gst::parse::launch(
-            "appsrc name=alac_src is-live=true format=time \
-             ! avdec_alac ! audioconvert ! audioresample ! autoaudiosink sync=false",
+            "appsrc name=alac_src is-live=true format=time do-timestamp=true \
+             ! queue ! avdec_alac ! audioconvert ! audioresample ! autoaudiosink sync=false",
         )
         .map_err(|e| format!("parse ALAC pipeline: {e}"))?
         .downcast::<gst::Pipeline>()
@@ -81,8 +121,8 @@ impl GStreamerPlayer {
         alac_src.set_stream_type(gst_app::AppStreamType::Stream);
 
         let aac_eld_pipeline = gst::parse::launch(
-            "appsrc name=aac_eld_src is-live=true format=time \
-             ! avdec_aac ! audioconvert ! audioresample ! autoaudiosink sync=false",
+            "appsrc name=aac_eld_src is-live=true format=time do-timestamp=true \
+             ! queue ! avdec_aac ! audioconvert ! audioresample ! autoaudiosink sync=false",
         )
         .map_err(|e| format!("parse AAC-ELD pipeline: {e}"))?
         .downcast::<gst::Pipeline>()
@@ -105,7 +145,34 @@ impl GStreamerPlayer {
         aac_eld_src.set_is_live(true);
         aac_eld_src.set_stream_type(gst_app::AppStreamType::Stream);
 
-        tracing::info!("GStreamer player ready (H.264 + ALAC/AAC-ELD)");
+        // Enable bus signal watches; the GLib pump thread will deliver sink UI events.
+        for pipeline in [&h264_pipeline, &alac_pipeline, &aac_eld_pipeline] {
+            if let Some(bus) = pipeline.bus() {
+                bus.set_sync_handler(|_bus, msg| {
+                    use gst::MessageView;
+                    match msg.view() {
+                        MessageView::Error(err) => {
+                            tracing::error!(
+                                error = %err.error(),
+                                debug = ?err.debug(),
+                                "GStreamer error"
+                            );
+                        }
+                        MessageView::Warning(w) => {
+                            tracing::warn!(
+                                error = %w.error(),
+                                debug = ?w.debug(),
+                                "GStreamer warning"
+                            );
+                        }
+                        _ => {}
+                    }
+                    gst::BusSyncReply::Pass
+                });
+            }
+        }
+
+        tracing::info!("GStreamer player ready (H.264 window + ALAC/AAC-ELD audio)");
 
         Ok(Self {
             h264_pipeline: Mutex::new(h264_pipeline),
@@ -116,6 +183,8 @@ impl GStreamerPlayer {
             aac_eld_src: Mutex::new(aac_eld_src),
             audio_compression: Mutex::new(None),
             hls_pipeline: Mutex::new(None),
+            _main_loop_thread: Some(main_loop_thread),
+            main_loop_quit,
         })
     }
 
@@ -315,6 +384,10 @@ impl Drop for GStreamerPlayer {
             if let Some(p) = slot.take() {
                 let _ = p.set_state(gst::State::Null);
             }
+        }
+        self.main_loop_quit.store(true, Ordering::Relaxed);
+        if let Some(handle) = self._main_loop_thread.take() {
+            let _ = handle.join();
         }
     }
 }

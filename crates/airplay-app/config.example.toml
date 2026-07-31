@@ -6,8 +6,9 @@ fps = 24
 
 [player]
 # h264-dump | gstreamer | ffmpeg | vlc
-# Build with matching Cargo feature, e.g.:
+# Live window (recommended):
 #   cargo run -p airplay-app --features gstreamer
-implementation = "h264-dump"
+# and set implementation = "gstreamer"
+implementation = "gstreamer"
 # Used by h264-dump only
 output = "dump.h264"

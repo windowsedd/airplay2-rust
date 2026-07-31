@@ -75,7 +75,15 @@ fn default_fps() -> u32 {
     24
 }
 fn default_implementation() -> String {
-    "h264-dump".into()
+    // Prefer a live window when GStreamer was compiled in.
+    #[cfg(feature = "gstreamer")]
+    {
+        "gstreamer".into()
+    }
+    #[cfg(not(feature = "gstreamer"))]
+    {
+        "h264-dump".into()
+    }
 }
 fn default_output() -> String {
     "dump.h264".into()
