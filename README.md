@@ -31,6 +31,11 @@ Design and task plan:
 - [Implementation plan](docs/superpowers/plans/2026-08-01-airplay2-rust-implementation.md)
 - [Acceptance checklist](docs/superpowers/plans/acceptance-checklist.md)
 
+AI / coding agents:
+
+- [AGENTS.md](./AGENTS.md) — shared agent instructions
+- [CLAUDE.md](./CLAUDE.md) — Claude entry (links to AGENTS.md)
+
 ## Prerequisites
 
 ### Rust
