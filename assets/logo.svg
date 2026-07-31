@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="airplay2-rust logo">
+  <title>airplay2-rust</title>
+  <defs>
+    <linearGradient id="rust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F48C06"/>
+      <stop offset="100%" stop-color="#E85D04"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#4CC9F0" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#F48C06" stop-opacity="0.85"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded tile background -->
+  <rect x="24" y="24" width="464" height="464" rx="96" fill="#1A1B1E"/>
+
+  <!-- Phone (source) -->
+  <rect x="92" y="168" width="88" height="152" rx="14" fill="none" stroke="url(#rust)" stroke-width="14"/>
+  <rect x="118" y="292" width="36" height="8" rx="4" fill="#F48C06"/>
+
+  <!-- Signal arcs -->
+  <path d="M210 210 A48 48 0 0 1 210 302" fill="none" stroke="url(#arc)" stroke-width="12" stroke-linecap="round"/>
+  <path d="M236 188 A78 78 0 0 1 236 324" fill="none" stroke="url(#arc)" stroke-width="12" stroke-linecap="round" opacity="0.85"/>
+  <path d="M262 166 A108 108 0 0 1 262 346" fill="none" stroke="url(#arc)" stroke-width="12" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Monitor (receiver) -->
+  <rect x="300" y="150" width="128" height="96" rx="12" fill="none" stroke="url(#rust)" stroke-width="14"/>
+  <path d="M340 246 L388 246 L400 280 L328 280 Z" fill="none" stroke="#F48C06" stroke-width="12" stroke-linejoin="round"/>
+  <line x1="328" y1="280" x2="400" y2="280" stroke="#F48C06" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- Soft screen fill -->
+  <rect x="318" y="168" width="92" height="60" rx="6" fill="#F48C06" opacity="0.18"/>
+</svg>

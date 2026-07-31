@@ -1,5 +1,13 @@
 # airplay2-rust
 
+<p align="center">
+  <img src="assets/logo.svg" alt="airplay2-rust logo" width="160" height="160" />
+</p>
+
+<p align="center">
+  <img src="assets/logo-banner.svg" alt="airplay2-rust" width="640" />
+</p>
+
 Rust port of [java-airplay-2open](https://github.com) — an **AirPlay receiver** (screen mirror / media) with pairing, FairPlay setup, RTSP control, media decrypt, mDNS advertisement, multiple player backends, and a small sender client.
 
 ## Disclaimer
