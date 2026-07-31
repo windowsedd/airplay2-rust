@@ -75,16 +75,8 @@ fn default_fps() -> u32 {
     24
 }
 fn default_implementation() -> String {
-    // Always prefer live window when the gstreamer feature is compiled in
-    // (it is part of package default features).
-    #[cfg(feature = "gstreamer")]
-    {
-        "gstreamer".into()
-    }
-    #[cfg(not(feature = "gstreamer"))]
-    {
-        "h264-dump".into()
-    }
+    // "auto" = dump.h264 + ffplay window + GStreamer window (whatever is built in).
+    "auto".into()
 }
 
 fn resolve_implementation(configured: &str) -> String {
@@ -174,12 +166,64 @@ fn missing_feature_msg(name: &str, feature: &str) -> String {
     )
 }
 
+fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
+    use airplay_server::AirPlayConsumer;
+
+    let mut parts: Vec<Box<dyn AirPlayConsumer>> = Vec::new();
+    let mut labels: Vec<&'static str> = Vec::new();
+
+    #[cfg(feature = "h264-dump")]
+    {
+        let dump = airplay_player::H264Dump::new(output)
+            .with_context(|| format!("open H.264 dump {output}"))?;
+        parts.push(Box::new(dump));
+        labels.push("h264-dump");
+    }
+
+    // ffplay is the most reliable *window* on Windows.
+    #[cfg(feature = "ffmpeg")]
+    {
+        match airplay_player::FFmpegPlayer::new() {
+            Ok(p) => {
+                parts.push(Box::new(p));
+                labels.push("ffmpeg/ffplay");
+            }
+            Err(e) => tracing::warn!(error = %e, "ffplay unavailable; no FFmpeg window"),
+        }
+    }
+
+    #[cfg(feature = "gstreamer")]
+    {
+        match airplay_player::GStreamerPlayer::new() {
+            Ok(p) => {
+                parts.push(Box::new(p));
+                labels.push("gstreamer");
+            }
+            Err(e) => tracing::warn!(error = %e, "GStreamer unavailable; no GStreamer window"),
+        }
+    }
+
+    if parts.is_empty() {
+        bail!(
+            "auto player: no backends available. Build with default features \
+             (h264-dump,gstreamer,ffmpeg) and install GStreamer + ffplay."
+        );
+    }
+
+    tracing::info!(
+        backends = %labels.join(" + "),
+        "player: auto (tee) — look for window title 'airplay2-rust'"
+    );
+    Ok(Arc::new(airplay_player::TeePlayer::new(parts)))
+}
+
 fn build_consumer(
     implementation: &str,
     output: &str,
 ) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
     let impl_key = implementation.to_ascii_lowercase();
     match impl_key.as_str() {
+        "auto" | "default" | "mirror" => build_auto_consumer(output),
         "h264-dump" | "h264_dump" | "dump" => {
             #[cfg(feature = "h264-dump")]
             {
@@ -235,7 +279,7 @@ fn build_consumer(
         other => {
             bail!(
                 "unsupported player implementation '{other}' \
-                 (supported: h264-dump, gstreamer, ffmpeg, vlc)"
+                 (supported: auto, h264-dump, gstreamer, ffmpeg, vlc)"
             );
         }
     }

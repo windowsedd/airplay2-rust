@@ -9,9 +9,9 @@ name = "airplay-app"
 path = "src/main.rs"
 
 [features]
-# Default: live GStreamer window. Machines without GStreamer can use:
-#   cargo run -p airplay-app --no-default-features --features h264-dump
-default = ["h264-dump", "gstreamer"]
+# Default: dump file + GStreamer + ffplay (auto tee). Needs GStreamer + ffplay for windows.
+# File-only: cargo run --no-default-features --features h264-dump
+default = ["h264-dump", "gstreamer", "ffmpeg"]
 h264-dump = ["airplay-player/h264-dump"]
 gstreamer = ["airplay-player/gstreamer"]
 ffmpeg = ["airplay-player/ffmpeg"]

@@ -55,6 +55,9 @@ async fn handle_video_connection(
     airplay: Arc<Mutex<AirPlay>>,
     consumer: Arc<dyn AirPlayConsumer>,
 ) -> std::io::Result<()> {
+    let mut packets: u64 = 0;
+    let mut frames_out: u64 = 0;
+    let mut decrypt_fail: u64 = 0;
     loop {
         let mut header = [0u8; VIDEO_HEADER_LEN];
         stream.read_exact(&mut header).await?;
@@ -68,9 +71,29 @@ async fn handle_video_connection(
         };
 
         let size = hdr.payload_size as usize;
+        // Guard absurd sizes (corrupt header) so we don't OOM.
+        if size > 16 * 1024 * 1024 {
+            warn!(size, payload_type = hdr.payload_type, "video payload too large; drop connection");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "video payload too large",
+            ));
+        }
         let mut payload = vec![0u8; size];
         if size > 0 {
             stream.read_exact(&mut payload).await?;
+        }
+
+        packets += 1;
+        if packets <= 8 || packets % 120 == 0 {
+            info!(
+                n = packets,
+                payload_type = hdr.payload_type,
+                size,
+                frames_out,
+                decrypt_fail,
+                "video packet"
+            );
         }
 
         match hdr.payload_type {
@@ -81,7 +104,10 @@ async fn handle_video_connection(
                     match ap.decrypt_video(&mut payload) {
                         Ok(()) => true,
                         Err(e) => {
-                            warn!("decrypt_video failed: {e}");
+                            decrypt_fail += 1;
+                            if decrypt_fail <= 5 || decrypt_fail % 60 == 0 {
+                                warn!(decrypt_fail, "decrypt_video failed: {e}");
+                            }
                             false
                         }
                     }
@@ -90,12 +116,20 @@ async fn handle_video_connection(
                     continue;
                 }
                 prepare_picture_nal_units(&mut payload);
+                frames_out += 1;
+                if frames_out == 1 {
+                    info!(bytes = payload.len(), "first decrypted video frame → consumer");
+                }
                 consumer.on_video(&payload);
             }
             1 => {
                 // SPS/PPS — no decrypt.
                 match prepare_sps_pps_nal_units(&payload) {
-                    Some(annex_b) => consumer.on_video(&annex_b),
+                    Some(annex_b) => {
+                        frames_out += 1;
+                        info!(bytes = annex_b.len(), "SPS/PPS annex-B → consumer");
+                        consumer.on_video(&annex_b);
+                    }
                     None => warn!("prepare_sps_pps_nal_units failed (truncated payload)"),
                 }
             }

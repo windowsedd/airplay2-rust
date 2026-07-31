@@ -55,8 +55,28 @@ impl AirPlay {
     }
 
     /// RTSP SETUP: store ekey/eiv or return media stream info.
+    ///
+    /// Resets lazy FairPlay decryptors when a new media stream is negotiated so
+    /// a second mirror session cannot reuse a stale AES-CTR state / stream id.
     pub fn rtsp_setup(&mut self, plist_bytes: &[u8]) -> Result<Option<MediaStreamInfo>> {
-        self.rtsp.setup(plist_bytes)
+        let info = self.rtsp.setup(plist_bytes)?;
+        if let Some(ref media) = info {
+            match media {
+                MediaStreamInfo::Video(_) => {
+                    self.fairplay_video_decryptor = None;
+                    tracing::debug!("reset FairPlay video decryptor after video SETUP");
+                }
+                MediaStreamInfo::Audio(_) => {
+                    self.fairplay_audio_decryptor = None;
+                    tracing::debug!("reset FairPlay audio decryptor after audio SETUP");
+                }
+            }
+        } else if self.rtsp.ekey().is_some() {
+            // First SETUP often only carries ekey/eiv — clear both so keys re-derive.
+            self.fairplay_video_decryptor = None;
+            self.fairplay_audio_decryptor = None;
+        }
+        Ok(info)
     }
 
     /// RTSP TEARDOWN: return media stream info if present.

@@ -5,11 +5,8 @@ height = 720
 fps = 24
 
 [player]
-# h264-dump | gstreamer | ffmpeg | vlc
-# Default build already enables gstreamer — plain `cargo run` opens a window.
-# File-only dump:
-#   cargo run --no-default-features --features h264-dump
-#   implementation = "h264-dump"
-implementation = "gstreamer"
-# Used by h264-dump only
+# auto = dump.h264 + ffplay + gstreamer (best chance of a live window)
+# Also: gstreamer | ffmpeg | h264-dump | vlc
+implementation = "auto"
+# Used by h264-dump / auto tee
 output = "dump.h264"

@@ -29,29 +29,30 @@ impl FFmpegPlayer {
     }
 
     fn spawn_ffplay() -> Result<(Child, ChildStdin), String> {
+        // Window title helps the user find the player among other windows.
         let mut child = Command::new("ffplay")
             .args([
+                "-window_title",
+                "airplay2-rust",
                 "-fflags",
-                "nobuffer",
+                "nobuffer+discardcorrupt",
                 "-flags",
                 "low_delay",
                 "-framedrop",
+                "-sync",
+                "ext",
                 "-f",
                 "h264",
-                "-codec:v",
-                "h264",
                 "-probesize",
-                "32",
+                "32768",
                 "-analyzeduration",
                 "0",
-                "-vf",
-                "setpts=0",
                 "-i",
                 "-",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null()) // avoid spam; use dump.h264 if playback fails
             .spawn()
             .map_err(|e| {
                 format!(
@@ -63,6 +64,7 @@ impl FFmpegPlayer {
             .stdin
             .take()
             .ok_or_else(|| "ffplay stdin not piped".to_string())?;
+        tracing::info!("ffplay window started (title: airplay2-rust)");
         Ok((child, stdin))
     }
 

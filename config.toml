@@ -5,6 +5,7 @@ height = 720
 fps = 24
 
 [player]
-# Live video window (default Cargo features include gstreamer)
-implementation = "gstreamer"
+# auto = dump.h264 + ffplay window + GStreamer window (recommended)
+# Also: gstreamer | ffmpeg | h264-dump | vlc
+implementation = "auto"
 output = "dump.h264"

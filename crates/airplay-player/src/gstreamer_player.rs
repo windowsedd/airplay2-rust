@@ -55,11 +55,11 @@ impl GStreamerPlayer {
             })
             .map_err(|e| format!("spawn gstreamer main loop: {e}"))?;
 
-        // queue isolates appsrc push thread from the decode/display chain.
+        // Match Java GstPlayerDefault pipeline (simple, reliable).
+        // Try d3d11/gl first via autovideosink; force-aspect-ratio when available.
         let h264_pipeline = gst::parse::launch(
-            "appsrc name=video_src is-live=true format=time do-timestamp=true \
-             ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 \
-             ! h264parse \
+            "appsrc name=h264-src is-live=true format=time do-timestamp=true \
+             ! h264parse config-interval=-1 \
              ! avdec_h264 \
              ! videoconvert \
              ! autovideosink name=videosink sync=false",
@@ -68,31 +68,33 @@ impl GStreamerPlayer {
         .downcast::<gst::Pipeline>()
         .map_err(|_| "H.264 launch result is not a Pipeline".to_string())?;
 
-        // Prefer a titled window when the sink supports it.
         if let Some(sink) = h264_pipeline.by_name("videosink") {
             if sink.find_property("title").is_some() {
-                sink.set_property_from_str("title", "airplay2-rust");
+                sink.set_property_from_str("title", "airplay2-rust (gstreamer)");
+            }
+            // Actual sink may be nested; try child.
+            if let Some(actual) = sink.downcast_ref::<gst::Bin>() {
+                let _ = actual;
             }
         }
 
         let h264_src = h264_pipeline
-            .by_name("video_src")
-            .ok_or_else(|| "missing appsrc video_src".to_string())?
+            .by_name("h264-src")
+            .ok_or_else(|| "missing appsrc h264-src".to_string())?
             .downcast::<gst_app::AppSrc>()
-            .map_err(|_| "video_src is not an AppSrc".to_string())?;
+            .map_err(|_| "h264-src is not an AppSrc".to_string())?;
 
         h264_src.set_caps(Some(
             &gst::Caps::from_str(
-                "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au",
+                "video/x-h264,colorimetry=bt709,stream-format=(string)byte-stream,alignment=(string)au",
             )
             .map_err(|e| format!("H.264 caps: {e}"))?,
         ));
         h264_src.set_format(gst::Format::Time);
         h264_src.set_is_live(true);
         h264_src.set_stream_type(gst_app::AppStreamType::Stream);
-        // Avoid blocking the media thread if the sink is slow.
-        h264_src.set_property("block", false);
-        h264_src.set_max_bytes(8 * 1024 * 1024);
+        h264_src.set_property("block", true);
+        h264_src.set_max_bytes(4 * 1024 * 1024);
 
         let alac_pipeline = gst::parse::launch(
             "appsrc name=alac_src is-live=true format=time do-timestamp=true \
@@ -229,6 +231,11 @@ impl AirPlayConsumer for GStreamerPlayer {
     }
 
     fn on_video(&self, data: &[u8]) {
+        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n % 120 == 0 {
+            tracing::info!(n, bytes = data.len(), "gstreamer push H.264");
+        }
         match self.h264_src.lock() {
             Ok(src) => Self::push_to_appsrc(&src, data),
             Err(e) => tracing::error!(error = %e, "H.264 appsrc mutex poisoned"),
