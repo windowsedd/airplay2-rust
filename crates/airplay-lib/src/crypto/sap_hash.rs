@@ -5,7 +5,7 @@ use super::hand_garble::garble;
 #[inline]
 fn rol8(input: u8, count: i32) -> u8 {
     let input = input as i32;
-    ((((input << count) & 0xff) | ((input & 0xff) >> (8 - count))) as u8)
+    (((input << count) & 0xff) | ((input & 0xff) >> (8 - count))) as u8
 }
 
 /// Port of Java `SapHash.sap_hash`.

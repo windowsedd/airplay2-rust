@@ -122,10 +122,10 @@ pub fn garble(
     }
 
     buffer3[8] = b(
-        ((((u(buffer0[(u(buffer3[4]) % 20) as usize]) & 95)
+        (((u(buffer0[(u(buffer3[4]) % 20) as usize]) & 95)
             & ((u(buffer4[(u(buffer1[68]) % 21) as usize]) & 46) << 1))
             | 16)
-            ^ 92),
+            ^ 92,
     );
 
     {
@@ -239,8 +239,8 @@ pub fn garble(
         let b4_21 = u(buffer4[(u(buffer3[0]) % 21) as usize]);
         let part1 = ((b40 | b24) & 177) | (b40 & b24);
         let part2 = ((b4_20 & 177) | 176) | (b4_21 & !3);
-        let part3 = ((((b40 & b24) | ((b40 | b24) & 177)) & 199)
-            | (((((b4_21 & 1) & 0xff) + 176) | (b4_21 & !3)) & u(buffer3[56])));
+        let part3 = (((b40 & b24) | ((b40 | b24) & 177)) & 199)
+            | (((((b4_21 & 1) & 0xff) + 176) | (b4_21 & !3)) & u(buffer3[56]));
         let inner = ((part1 & part2) | part3) & (!u(buffer3[52]));
         buffer3[64] = b(u(buffer3[4]) + (inner | u(buffer3[48])));
     }
@@ -265,9 +265,9 @@ pub fn garble(
     buffer2[5] = b(s(buffer2[5]) - u(buffer4[(u(buffer1[92]) % 21) as usize]));
 
     {
-        let A = ((((u(buffer1[41]) & !24) | (u(buffer2[(u(buffer1[183]) % 35) as usize]) & 24))
+        let A = (((u(buffer1[41]) & !24) | (u(buffer2[(u(buffer1[183]) % 35) as usize]) & 24))
             & (u(buffer3[16]) + 53))
-            | (s(buffer3[20]) & u(buffer2[(u(buffer3[20]) % 35) as usize])));
+            | (s(buffer3[20]) & u(buffer2[(u(buffer3[20]) % 35) as usize]));
         let B = (u(buffer1[17]) & !u(buffer3[44]))
             | (u(buffer0[(u(buffer1[59]) % 20) as usize]) & u(buffer3[44]));
         buffer2[18] = b(s(buffer2[18]) ^ (A * B));
@@ -275,10 +275,10 @@ pub fn garble(
 
     {
         let A = weird_ror8(u(buffer1[11]), u(buffer2[(u(buffer1[28]) % 35) as usize]) & 7) & 7;
-        let B = ((((u(buffer0[(u(buffer1[93]) % 20) as usize]) & !u(buffer0[14]))
+        let B = (((u(buffer0[(u(buffer1[93]) % 20) as usize]) & !u(buffer0[14]))
             | (u(buffer0[14]) & 150))
             & !28)
-            | (u(buffer1[7]) & 28));
+            | (u(buffer1[7]) & 28);
         let wr = weird_rol8(u(buffer2[(u(buffer3[0]) % 35) as usize]), A);
         buffer2[22] = b(((((B | wr) & u(buffer2[33])) | (B & wr)) + 74) & 0xff);
     }
@@ -293,11 +293,11 @@ pub fn garble(
     {
         let b2v = s(buffer2[(u(buffer1[57]) % 35) as usize]);
         let b0v = s(buffer0[(u(buffer3[64]) % 20) as usize]);
-        let B = (((b2v & b0v) | ((b0v | b2v) & 95) | (s(buffer3[64]) & 45) | 82) & 32);
+        let B = ((b2v & b0v) | ((b0v | b2v) & 95) | (s(buffer3[64]) & 45) | 82) & 32;
         let C = ((b2v & b0v) | ((b2v | b0v) & 95)) & ((s(buffer3[64]) & 45) | 82);
-        let D = ((((u(buffer3[0]) / 3) - (u(buffer3[64]) | u(buffer1[22]))))
+        let D = (((u(buffer3[0]) / 3) - (u(buffer3[64]) | u(buffer1[22]))))
             ^ (u(buffer3[28]) + 62)
-            ^ (B | C));
+            ^ (B | C);
         T = u(buffer0[(D & 0xff) as usize % 20]);
     }
 
@@ -429,11 +429,11 @@ pub fn garble(
     }
 
     {
-        let C = ((u(buffer4[(u(buffer1[168]) % 21) as usize])
+        let C = (u(buffer4[(u(buffer1[168]) % 21) as usize])
             & s(buffer0[(u(buffer1[29]) % 20) as usize])
             & 7)
             | ((s(buffer4[(u(buffer1[168]) % 21) as usize]) | s(buffer0[(u(buffer1[29]) % 20) as usize]))
-                & 6));
+                & 6);
         let F = (u(buffer4[(u(buffer1[155]) % 21) as usize]) & u(buffer1[105]))
             | ((u(buffer4[(u(buffer1[155]) % 21) as usize]) | u(buffer1[105])) & 141);
         let idx = weird_rol32(F, C) % 21;
@@ -504,9 +504,9 @@ pub fn garble(
     buffer2[29] = 162;
 
     {
-        let A = (((u(buffer4[(u(buffer3[88]) % 21) as usize]) & 160)
+        let A = ((u(buffer4[(u(buffer3[88]) % 21) as usize]) & 160)
             | (u(buffer0[(u(buffer1[125]) % 20) as usize]) & 95))
-            >> 1);
+            >> 1;
         let B = u(buffer2[(u(buffer1[149]) % 35) as usize]) ^ (u(buffer1[43]) * u(buffer1[43]));
         buffer0[15] = b(s(buffer0[15]) + ((B & A) | ((A | B) & 115)));
     }
@@ -551,11 +551,11 @@ pub fn garble(
     {
         let B = (u(buffer1[32]) & u(buffer2[(u(buffer3[88]) % 35) as usize]))
             | ((u(buffer1[32]) | u(buffer2[(u(buffer3[88]) % 35) as usize])) & 23);
-        let D = (((u(buffer4[(u(buffer1[57]) % 21) as usize]) * 231) & 169) | (B & 86));
-        let F = ((((u(buffer0[(u(buffer1[82]) % 20) as usize]) & !29)
+        let D = ((u(buffer4[(u(buffer1[57]) % 21) as usize]) * 231) & 169) | (B & 86);
+        let F = (((u(buffer0[(u(buffer1[82]) % 20) as usize]) & !29)
             | (u(buffer4[(u(buffer3[124]) % 21) as usize]) & 29))
             & 190)
-            | (u(buffer4[((D / 5) % 21) as usize]) & !190));
+            | (u(buffer4[((D / 5) % 21) as usize]) & !190);
         let h0 = u(buffer0[(u(buffer3[40]) % 20) as usize]);
         let H = h0 * h0 * h0;
         let K = (H & u(buffer1[82])) | (H & 92) | (u(buffer1[82]) & 92);
