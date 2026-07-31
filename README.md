@@ -357,16 +357,17 @@ See [`crates/airplay-app/config.example.toml`](crates/airplay-app/config.example
 ```toml
 [airplay]
 server_name = "airplay2-rust"
-width = 1280
-height = 720
-fps = 24
+width = 1920
+height = 1080
+fps = 60
 
 [player]
-# h264-dump | gstreamer | ffmpeg | vlc
-implementation = "h264-dump"
-# Used by h264-dump only
+# auto | h264-dump | gstreamer | ffmpeg | vlc
+implementation = "auto"
+# Used by h264-dump / auto
 output = "dump.h264"
 ```
+
 
 ## Device mirror steps
 
