@@ -190,12 +190,12 @@ impl VideoStreamInfo {
     }
 }
 
-/// Audio stream setup info.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Audio stream setup info (fields optional — matches Java builder).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AudioStreamInfo {
-    pub compression_type: CompressionType,
-    pub audio_format: AudioFormat,
-    pub samples_per_frame: i32,
+    pub compression_type: Option<CompressionType>,
+    pub audio_format: Option<AudioFormat>,
+    pub samples_per_frame: Option<i32>,
 }
 
 impl AudioStreamInfo {
@@ -205,9 +205,9 @@ impl AudioStreamInfo {
         samples_per_frame: i32,
     ) -> Self {
         Self {
-            compression_type,
-            audio_format,
-            samples_per_frame,
+            compression_type: Some(compression_type),
+            audio_format: Some(audio_format),
+            samples_per_frame: Some(samples_per_frame),
         }
     }
 }

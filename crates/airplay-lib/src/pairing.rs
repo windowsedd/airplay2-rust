@@ -76,6 +76,12 @@ impl Pairing {
         self.ecdh_secret.as_ref()
     }
 
+    /// Inject ECDH shared secret for unit tests that skip pair-verify.
+    #[cfg(test)]
+    pub fn set_shared_secret_for_test(&mut self, secret: [u8; 32]) {
+        self.ecdh_secret = Some(secret);
+    }
+
     fn pair_verify_phase1(&mut self, body: &[u8]) -> Result<Vec<u8>> {
         if body.len() < 64 {
             return Err(AirPlayError::Pairing(
