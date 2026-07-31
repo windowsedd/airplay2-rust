@@ -1,4 +1,4 @@
-﻿.worktrees/
+.worktrees/
 target/
 **/*.rs.bk
 .idea/
