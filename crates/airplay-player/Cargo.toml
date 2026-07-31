@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Prefer live window when built as a dependency with default features.
-default = ["h264-dump", "gstreamer"]
+# Default: no GStreamer (needs pkg-config on Windows). Enable with --features gstreamer.
+default = ["h264-dump"]
 h264-dump = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
 ffmpeg = []

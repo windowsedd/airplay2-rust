@@ -30,8 +30,12 @@ struct AirplaySection {
     width: u32,
     #[serde(default = "default_height")]
     height: u32,
-    #[serde(default = "default_fps")]
+    /// Advertised maxFPS to the iPhone (cap, not a hard lock).
+    #[serde(default = "default_fps", alias = "max_fps", alias = "maxFPS")]
     fps: u32,
+    /// Advertised display refreshRate (usually 60).
+    #[serde(default = "default_refresh_rate", alias = "refreshRate")]
+    refresh_rate: u32,
 }
 
 impl Default for AirplaySection {
@@ -41,6 +45,7 @@ impl Default for AirplaySection {
             width: default_width(),
             height: default_height(),
             fps: default_fps(),
+            refresh_rate: default_refresh_rate(),
         }
     }
 }
@@ -72,7 +77,10 @@ fn default_height() -> u32 {
     720
 }
 fn default_fps() -> u32 {
-    24
+    30
+}
+fn default_refresh_rate() -> u32 {
+    60
 }
 fn default_implementation() -> String {
     // "auto" = dump.h264 + ffplay window + GStreamer window (whatever is built in).
@@ -155,7 +163,8 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         "server_name = \"airplay2-rust\"\n",
         "width = 1280\n",
         "height = 720\n",
-        "fps = 24\n",
+        "fps = 30\n",
+        "refresh_rate = 60\n",
         "\n",
         "[player]\n",
         "# auto = dump.h264 + ffplay window + GStreamer window\n",
@@ -168,7 +177,7 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         tracing::info!("wrote config.toml (player=auto — live window)");
     }
 
-    tracing::info!("using defaults: player=auto (ffplay + gstreamer + dump.h264)");
+    tracing::info!("using defaults: player=auto (ffplay window + dump.h264; gstreamer if built with --features gstreamer)");
     Ok(default_config())
 }
 
@@ -343,12 +352,28 @@ async fn main() -> Result<()> {
     let config_path = parse_args();
     let cfg = load_config(config_path.as_deref())?;
 
+    let fps = cfg.airplay.fps.clamp(1, 120);
+    let refresh_rate = cfg.airplay.refresh_rate.clamp(1, 240);
+    if cfg.airplay.fps != fps {
+        tracing::warn!(requested = cfg.airplay.fps, using = fps, "fps clamped to 1..=120");
+    }
+
     let server_cfg = AirPlayConfig {
         server_name: cfg.airplay.server_name.clone(),
         width: cfg.airplay.width,
         height: cfg.airplay.height,
-        fps: cfg.airplay.fps,
+        fps,
+        refresh_rate,
     };
+
+    tracing::info!(
+        name = %server_cfg.server_name,
+        width = server_cfg.width,
+        height = server_cfg.height,
+        max_fps = server_cfg.fps,
+        refresh_rate = server_cfg.refresh_rate,
+        "advertising display to iPhone (maxFPS is a cap — phone chooses actual rate)"
+    );
 
     let implementation = resolve_implementation(&cfg.player.implementation);
     let consumer = build_consumer(&implementation, &cfg.player.output).with_context(|| {
@@ -366,7 +391,8 @@ async fn main() -> Result<()> {
         name = %cfg.airplay.server_name,
         port = server.port(),
         player = %implementation,
-        "AirPlay receiver running — Screen Mirror to this name; GStreamer opens a video window"
+        max_fps = fps,
+        "AirPlay receiver running — reconnect Screen Mirroring after changing fps"
     );
 
     tokio::signal::ctrl_c()

@@ -42,17 +42,40 @@ AI / coding agents:
 
 - Rust **1.70+** recommended (workspace uses edition 2021). Install via [rustup](https://rustup.rs/).
 
-### Default run (live window)
+### Default run (live window via **ffplay**)
 
-Plain **`cargo run`** builds **airplay-app** with **GStreamer** enabled and opens a video window when a device mirrors.
+Plain **`cargo run`** does **not** need GStreamer. It uses **h264-dump + ffmpeg/ffplay** (install FFmpeg so `ffplay` is on `PATH`).
 
-You need GStreamer 1.x installed and on `PATH` (see below). Without GStreamer:
+```powershell
+# Windows (from repo root)
+.\run.ps1
+# or:
+cargo run
+```
+
+### GStreamer build on Windows (optional)
+
+Rust’s `gstreamer` crates need **`pkg-config.exe`** (ships in GStreamer `bin`) **and** `PKG_CONFIG_PATH`:
+
+```powershell
+# Easiest:
+.\run.ps1 -GStreamer
+
+# Manual:
+$gst = "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+$env:Path = "$gst\bin;" + $env:Path   # includes pkg-config.exe
+$env:PKG_CONFIG_PATH = "$gst\lib\pkgconfig"
+$env:GST_PLUGIN_PATH = "$gst\lib\gstreamer-1.0"
+cargo run -p airplay-app --features "h264-dump,ffmpeg,gstreamer"
+```
+
+If you see `The pkg-config command could not be found`, you forgot to add GStreamer’s `bin` to `PATH` for that terminal.
+
+File dump only:
 
 ```bash
 cargo run -p airplay-app --no-default-features --features h264-dump
 ```
-
-(file dump only, no window)
 
 ### Firewall / mDNS (all OSes)
 
