@@ -75,7 +75,8 @@ fn default_fps() -> u32 {
     24
 }
 fn default_implementation() -> String {
-    // Prefer a live window when GStreamer was compiled in.
+    // Always prefer live window when the gstreamer feature is compiled in
+    // (it is part of package default features).
     #[cfg(feature = "gstreamer")]
     {
         "gstreamer".into()
@@ -83,6 +84,16 @@ fn default_implementation() -> String {
     #[cfg(not(feature = "gstreamer"))]
     {
         "h264-dump".into()
+    }
+}
+
+fn resolve_implementation(configured: &str) -> String {
+    let key = configured.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "gst" => "gstreamer".into(),
+        "ffplay" => "ffmpeg".into(),
+        "h264_dump" | "dump" => "h264-dump".into(),
+        other => other.to_string(),
     }
 }
 fn default_output() -> String {
@@ -248,7 +259,14 @@ async fn main() -> Result<()> {
         fps: cfg.airplay.fps,
     };
 
-    let consumer = build_consumer(&cfg.player.implementation, &cfg.player.output)?;
+    let implementation = resolve_implementation(&cfg.player.implementation);
+    let consumer = build_consumer(&implementation, &cfg.player.output).with_context(|| {
+        format!(
+            "failed to start player '{implementation}'. \
+             For a live window you need GStreamer 1.x on PATH (see README). \
+             Or run: cargo run -p airplay-app --no-default-features --features h264-dump"
+        )
+    })?;
 
     let mut server = AirPlayServer::new(server_cfg, consumer);
     server.start().await.context("start AirPlay server")?;
@@ -256,7 +274,8 @@ async fn main() -> Result<()> {
     tracing::info!(
         name = %cfg.airplay.server_name,
         port = server.port(),
-        "AirPlay receiver running — press Ctrl+C to stop"
+        player = %implementation,
+        "AirPlay receiver running — Screen Mirror to this name; GStreamer opens a video window"
     );
 
     tokio::signal::ctrl_c()

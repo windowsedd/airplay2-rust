@@ -9,7 +9,9 @@ name = "airplay-app"
 path = "src/main.rs"
 
 [features]
-default = ["h264-dump"]
+# Default: live GStreamer window. Machines without GStreamer can use:
+#   cargo run -p airplay-app --no-default-features --features h264-dump
+default = ["h264-dump", "gstreamer"]
 h264-dump = ["airplay-player/h264-dump"]
 gstreamer = ["airplay-player/gstreamer"]
 ffmpeg = ["airplay-player/ffmpeg"]
@@ -17,6 +19,7 @@ vlc = ["airplay-player/vlc"]
 
 [dependencies]
 airplay-server = { workspace = true }
+# Inherit player features from this package's feature flags (not player defaults alone).
 airplay-player = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 tokio = { workspace = true }

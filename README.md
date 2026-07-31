@@ -42,9 +42,17 @@ AI / coding agents:
 
 - Rust **1.70+** recommended (workspace uses edition 2021). Install via [rustup](https://rustup.rs/).
 
-### Core (no media libs)
+### Default run (live window)
 
-Default build uses **h264-dump** only — no GStreamer, FFmpeg, or VLC required.
+Plain **`cargo run`** builds **airplay-app** with **GStreamer** enabled and opens a video window when a device mirrors.
+
+You need GStreamer 1.x installed and on `PATH` (see below). Without GStreamer:
+
+```bash
+cargo run -p airplay-app --no-default-features --features h264-dump
+```
+
+(file dump only, no window)
 
 ### Firewall / mDNS (all OSes)
 

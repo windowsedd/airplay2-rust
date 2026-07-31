@@ -7,6 +7,8 @@ members = [
     "crates/airplay-client",
     "crates/airplay-app",
 ]
+# `cargo run` from the workspace root starts the receiver (GStreamer by default).
+default-members = ["crates/airplay-app"]
 
 [workspace.package]
 version = "0.1.0"

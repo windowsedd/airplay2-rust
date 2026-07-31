@@ -39,7 +39,12 @@ Canonical docs:
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -p airplay-app --features "h264-dump,gstreamer,ffmpeg" -- --config config.toml
+# Live window (default features include gstreamer):
+cargo run
+# or:
+cargo run -p airplay-app -- --config config.toml
+# File-only dump (no GStreamer):
+cargo run -p airplay-app --no-default-features --features h264-dump
 ```
 
 Windows GStreamer (typical):
