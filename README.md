@@ -1,5 +1,7 @@
 # airplay2-rust
 
+**English** | [**繁體中文**](#播放器--players-繁體中文)
+
 <p align="center">
   <img src="assets/logo.svg" alt="airplay2-rust logo" width="160" height="160" />
 </p>
@@ -43,6 +45,86 @@ AI / coding agents:
 
 - [AGENTS.md](./AGENTS.md) — shared agent instructions
 - [CLAUDE.md](./CLAUDE.md) — Claude entry (links to AGENTS.md)
+
+## Players
+
+Select the backend with `player.implementation` in `config.toml` (must match a **Cargo feature** built into the binary). Default app features are `h264-dump` + `ffmpeg` (no GStreamer / pkg-config). Use `implementation = "auto"` to tee **h264-dump + ffplay** (and GStreamer if that feature was compiled in).
+
+### GStreamer
+
+- Supports **video and audio** streams (**ALAC** + **AAC-ELD**).
+- Requires [GStreamer](https://gstreamer.freedesktop.org/download/) 1.x installed (plugins for `h264parse`, `avdec_h264`, `avdec_alac` / `avdec_aac`, `autovideosink`, etc.).
+- On Windows, the Rust crates need **`pkg-config`** (ships in GStreamer’s `bin`) and `PKG_CONFIG_PATH` — easiest: `.\run.ps1 -GStreamer`.
+- Config: `implementation = "gstreamer"` with `--features gstreamer`.
+
+### FFmpeg
+
+- **Video only** via **`ffplay`** (H.264 annex-B on stdin).
+- **AAC-ELD** audio is not handled by this backend; full AAC-ELD in FFmpeg generally needs a build with e.g. `--enable-libfdk-aac` (and a custom player path — not the default `ffplay` mirror path).
+- Requires **FFmpeg** installed with **`ffplay` on `PATH`**.
+- Config: `implementation = "ffmpeg"` (default features already include `ffmpeg`).
+
+### VLC
+
+- Playback often **stops after a few seconds** (unstable stdin H.264 demux).
+- Requires **VLC** installed (`vlc` / `cvlc` on `PATH`).
+- Prefer GStreamer or FFmpeg for real use.
+- Config: `implementation = "vlc"` with `--features vlc`.
+
+### h264-dump
+
+- Writes the video stream to a file (default **`dump.h264`**).
+- No live window, no system media libraries required.
+- Useful for protocol debugging: `ffplay -f h264 dump.h264`.
+- Config: `implementation = "h264-dump"` (always available with default features).
+
+| Backend | Video | Audio | Needs | Stability |
+|---------|-------|-------|-------|-----------|
+| **GStreamer** | Yes | ALAC + AAC-ELD | GStreamer 1.x (+ pkg-config to **build**) | Best for live A/V |
+| **FFmpeg** | Yes (`ffplay`) | No (default path) | `ffplay` on `PATH` | Good for video window |
+| **VLC** | Yes | No | VLC on `PATH` | Stops after a few seconds |
+| **h264-dump** | File only | No | None | Stable dump for analysis |
+| **auto** | dump + ffplay (+ GST if built) | via GST if enabled | `ffplay` on `PATH` | Recommended default |
+
+## 播放器 / Players (繁體中文)
+
+在 `config.toml` 設定 `player.implementation`（須與編譯進 binary 的 **Cargo feature** 一致）。預設 feature 為 `h264-dump` + `ffmpeg`（不需 GStreamer / pkg-config）。`implementation = "auto"` 會同時使用 **h264-dump + ffplay**（若編譯時有開啟 gstreamer 也會一併使用）。
+
+### GStreamer
+
+- 支援**視訊與音訊**流（**ALAC** + **AAC-ELD**）。
+- 需安裝 [GStreamer](https://gstreamer.freedesktop.org/download/) 1.x（含 `h264parse`、`avdec_h264`、`avdec_alac` / `avdec_aac`、`autovideosink` 等外掛）。
+- Windows 編譯 Rust binding 需要 **`pkg-config`**（位於 GStreamer 的 `bin`）與 `PKG_CONFIG_PATH` — 建議：`.\run.ps1 -GStreamer`。
+- 設定：`implementation = "gstreamer"`，並以 `--features gstreamer` 編譯。
+
+### FFmpeg
+
+- **僅支援視訊**（透過 **`ffplay`** 播放 stdin 的 H.264 annex-B）。
+- 預設路徑**不處理 AAC-ELD 音訊**；若要在 FFmpeg 生態完整支援 AAC-ELD，通常需自行編譯並啟用如 `--enable-libfdk-aac`（非本專案預設 `ffplay` 鏡像路徑）。
+- 需安裝 **FFmpeg**，且 **`ffplay` 必須在 `PATH` 中**。
+- 設定：`implementation = "ffmpeg"`（預設 feature 已含 `ffmpeg`）。
+
+### VLC
+
+- 播放常在**數秒後停止**（stdin H.264 demux 不穩定）。
+- 需安裝 **VLC**（`vlc` / `cvlc` 在 `PATH`）。
+- 實際使用請優先選 GStreamer 或 FFmpeg。
+- 設定：`implementation = "vlc"`，並以 `--features vlc` 編譯。
+
+### h264-dump
+
+- 將視訊流寫入檔案（預設 **`dump.h264`**）。
+- 無即時視窗、不需系統多媒體函式庫。
+- 適合協定除錯：`ffplay -f h264 dump.h264`。
+- 設定：`implementation = "h264-dump"`（預設 feature 可用）。
+
+| 後端 | 視訊 | 音訊 | 需求 | 穩定性 |
+|------|------|------|------|--------|
+| **GStreamer** | 有 | ALAC + AAC-ELD | GStreamer 1.x（編譯需 pkg-config） | 即時影音較佳 |
+| **FFmpeg** | 有（`ffplay`） | 無（預設路徑） | `PATH` 中有 `ffplay` | 視訊視窗可用 |
+| **VLC** | 有 | 無 | `PATH` 中有 VLC | 數秒後易停 |
+| **h264-dump** | 僅檔案 | 無 | 無 | 除錯用穩定 |
+| **auto** | dump + ffplay（+ 可選 GST） | 若有 GST | `PATH` 中有 `ffplay` | **建議預設** |
 
 ## Prerequisites
 
@@ -241,7 +323,7 @@ Default config (when no `config.toml` is found):
 |---------|-----|---------|
 | `[airplay]` | `server_name` | `airplay2-rust` |
 | | `width` / `height` / `fps` | `1280` / `720` / `24` |
-| `[player]` | `implementation` | `h264-dump` |
+| `[player]` | `implementation` | `auto` |
 | | `output` | `dump.h264` |
 
 Supported `player.implementation` values (must match a compiled feature):
@@ -379,7 +461,7 @@ Limits: discovery/control/encrypt are present; full mirror **sender** (media soc
 | **mDNS permissions** | Advertise/browse soft-fail when UDP 5353 or multicast is blocked; device may not list the receiver. See firewall/mDNS notes above. |
 | **Audio complexity** | ALAC / AAC-ELD decrypt and player paths exist; A/V sync, buffering, and edge formats are less battle-tested than video dump. |
 | **VLC backend** | Best-effort stdin H.264; often flaky vs GStreamer/FFmpeg. |
-| **Default player** | App default is `h264-dump` so clean builds work without system media libs. Production-style live mirror uses GStreamer when installed. |
+| **Default player** | App default is `auto` (`h264-dump` + `ffplay`). GStreamer is optional (`--features gstreamer` / `.\run.ps1 -GStreamer`) for ALAC/AAC-ELD live audio. |
 | **Client** | Discovery + pair + encrypt primitives; not a full AirPlay sender application. |
 | **Platforms** | Intended for **Windows / Linux / macOS**. Real-device mirror acceptance is manual on at least one OS. |
 
