@@ -4,14 +4,24 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use airplay_lib::AirPlay;
+use tokio::task::AbortHandle;
 
 /// Active AirPlay session keyed by `Active-Remote` / session id.
 ///
-/// Media server handles are added in later tasks; placeholders are fine for now.
+/// Media accept loops are placeholders until Task 10 wires decrypt → consumer.
 pub struct Session {
     pub id: String,
     pub airplay: AirPlay,
-    // Media handles (VideoServer / AudioServer / etc.) land in later tasks.
+    /// Bound video data port (ephemeral), if SETUP video ran.
+    pub video_port: Option<u16>,
+    /// Bound audio data port (ephemeral), if SETUP audio ran.
+    pub audio_port: Option<u16>,
+    /// Bound audio control port (ephemeral), if SETUP audio ran.
+    pub audio_control_port: Option<u16>,
+    /// Placeholder accept-loop abort handles (Task 10 replaces with real media servers).
+    pub video_task: Option<AbortHandle>,
+    pub audio_task: Option<AbortHandle>,
+    pub audio_control_task: Option<AbortHandle>,
 }
 
 impl Session {
@@ -19,7 +29,29 @@ impl Session {
         Self {
             id: id.into(),
             airplay: AirPlay::new(),
+            video_port: None,
+            audio_port: None,
+            audio_control_port: None,
+            video_task: None,
+            audio_task: None,
+            audio_control_task: None,
         }
+    }
+
+    /// Abort placeholder media accept tasks and clear ports.
+    pub fn stop_media(&mut self) {
+        if let Some(h) = self.video_task.take() {
+            h.abort();
+        }
+        if let Some(h) = self.audio_task.take() {
+            h.abort();
+        }
+        if let Some(h) = self.audio_control_task.take() {
+            h.abort();
+        }
+        self.video_port = None;
+        self.audio_port = None;
+        self.audio_control_port = None;
     }
 }
 

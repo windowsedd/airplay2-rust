@@ -9,3 +9,7 @@ airplay-lib = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+plist = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
