@@ -249,8 +249,9 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
 
     let mut parts: Vec<Box<dyn AirPlayConsumer>> = Vec::new();
     let mut labels: Vec<&'static str> = Vec::new();
+    let mut have_live_window = false;
 
-    // 1) Always dump for debugging (if feature on).
+    // 1) Always dump for debugging (file only — no extra window).
     #[cfg(feature = "h264-dump")]
     {
         let dump = airplay_player::H264Dump::new(output)
@@ -259,22 +260,22 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
         labels.push("h264-dump");
     }
 
-    // 2) GStreamer first for live video + ALAC/AAC-ELD audio (default feature).
+    // 2) One live window only: prefer GStreamer (video + ALAC/AAC-ELD).
     #[cfg(feature = "gstreamer")]
     {
         match airplay_player::GStreamerPlayer::new() {
             Ok(p) => {
                 parts.push(Box::new(p));
                 labels.push("gstreamer");
+                have_live_window = true;
                 tracing::info!(
-                    "GStreamer backend ready — primary live window (video + ALAC/AAC-ELD)"
+                    "GStreamer live window ready (video + ALAC/AAC-ELD) — title airplay2-rust"
                 );
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "GStreamer init failed (is GStreamer 1.x installed and on PATH?). \
-                     Will try ffplay fallback if available."
+                    "GStreamer init failed; will try ffplay as single fallback window"
                 );
             }
         }
@@ -282,30 +283,35 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
     #[cfg(not(feature = "gstreamer"))]
     {
         tracing::warn!(
-            "binary built without --features gstreamer; rebuild with default features for GStreamer"
+            "binary built without --features gstreamer; rebuild with defaults for GStreamer"
         );
     }
 
-    // 3) ffplay as secondary video window / fallback.
-    #[cfg(feature = "ffmpeg")]
-    {
-        match airplay_player::FFmpegPlayer::new() {
-            Ok(p) => {
-                p.set_dump_path(output);
-                parts.push(Box::new(p));
-                labels.push("ffmpeg/ffplay");
-                tracing::info!(
-                    dump = %output,
-                    "ffplay backend ready (secondary / fallback video window)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "ffplay unavailable (optional fallback). Primary path is GStreamer."
-                );
+    // 3) ffplay only if GStreamer did not start (avoid two video windows).
+    if !have_live_window {
+        #[cfg(feature = "ffmpeg")]
+        {
+            match airplay_player::FFmpegPlayer::new() {
+                Ok(p) => {
+                    p.set_dump_path(output);
+                    parts.push(Box::new(p));
+                    labels.push("ffmpeg/ffplay");
+                    have_live_window = true;
+                    tracing::info!(
+                        dump = %output,
+                        "ffplay fallback window ready (title: airplay2-rust)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "ffplay also unavailable — no live window (dump only)"
+                    );
+                }
             }
         }
+    } else {
+        tracing::info!("skipping ffplay so you only get one mirror window (GStreamer)");
     }
 
     if parts.is_empty() {
@@ -316,9 +322,14 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
         );
     }
 
+    if !have_live_window {
+        tracing::warn!("no live window backend — only file dump if h264-dump is enabled");
+    }
+
     tracing::info!(
         backends = %labels.join(" + "),
-        "player: auto (tee) — primary live UI is GStreamer when listed"
+        live = have_live_window,
+        "player: auto (one live window + optional dump)"
     );
     Ok(Arc::new(airplay_player::TeePlayer::new(parts)))
 }
