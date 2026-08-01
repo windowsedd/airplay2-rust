@@ -42,24 +42,43 @@ impl FFmpegPlayer {
     }
 
     fn spawn_ffplay(&self) -> Result<(Child, ChildStdin), String> {
-        let mut cmd = Command::new(&self.ffplay_path);
+        // Try preferred path first, then plain "ffplay" on PATH.
+        let candidates: Vec<PathBuf> = {
+            let mut v = vec![self.ffplay_path.clone()];
+            if self.ffplay_path.as_os_str() != "ffplay" {
+                v.push(PathBuf::from("ffplay"));
+            }
+            v
+        };
+
+        let mut last_err = String::from("no ffplay candidate");
+        for path in &candidates {
+            match Self::spawn_one(path) {
+                Ok(pair) => return Ok(pair),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "ffplay spawn attempt failed");
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    fn spawn_one(path: &PathBuf) -> Result<(Child, ChildStdin), String> {
+        let mut cmd = Command::new(path);
         cmd.args([
             "-hide_banner",
             "-loglevel",
             "warning",
             "-window_title",
             "airplay2-rust",
-            "-alwaysontop",
             "-fflags",
             "nobuffer+discardcorrupt+genpts",
             "-flags",
             "low_delay",
             "-framedrop",
-            "-strict",
-            "experimental",
             "-f",
             "h264",
-            // Wait for SPS/PPS + a few frames before giving up probe.
             "-probesize",
             "2000000",
             "-analyzeduration",
@@ -71,22 +90,12 @@ impl FFmpegPlayer {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-        // Windows: ensure a visible process/window (not attached only to cargo).
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB (best-effort)
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
-        }
+        // Do NOT use CREATE_BREAKAWAY_FROM_JOB — it returns Access Denied (os error 5)
+        // when the parent is inside a Windows Job (cargo, VS Code, Terminal, etc.).
 
-        let mut child = cmd.spawn().map_err(|e| {
-            format!(
-                "failed to spawn ffplay at {}: {e}",
-                self.ffplay_path.display()
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn ffplay at {}: {e}", path.display()))?;
 
         let stdin = child
             .stdin
@@ -94,8 +103,8 @@ impl FFmpegPlayer {
             .ok_or_else(|| "ffplay stdin not piped".to_string())?;
 
         tracing::info!(
-            path = %self.ffplay_path.display(),
-            "ffplay window started (title: airplay2-rust) — look for it on the taskbar"
+            path = %path.display(),
+            "ffplay window started (title: airplay2-rust) — check taskbar"
         );
         Ok((child, stdin))
     }
@@ -156,33 +165,41 @@ impl FFmpegPlayer {
     }
 }
 
-/// Prefer a real `ffplay.exe` over a broken shim when possible.
+/// Prefer the real FFmpeg `ffplay.exe` over Chocolatey ShimGen (shims often break under Job objects).
 fn resolve_ffplay() -> Result<PathBuf, String> {
-    // 1) Try PATH via `where` on Windows / `which` elsewhere.
     #[cfg(windows)]
     {
+        // 1) Chocolatey real tools path (not the shim in bin\)
+        let real = PathBuf::from(r"C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\ffplay.exe");
+        if real.is_file() {
+            tracing::info!(path = %real.display(), "using real ffplay.exe (not Chocolatey shim)");
+            return Ok(real);
+        }
+
+        // 2) `where ffplay` — skip *\chocolatey\bin\* shims when a deeper tools path exists
         if let Ok(out) = Command::new("where").arg("ffplay").output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
+                let mut shim: Option<PathBuf> = None;
                 for line in text.lines() {
                     let p = PathBuf::from(line.trim());
-                    if p.extension().and_then(|e| e.to_str()) == Some("exe") && p.is_file() {
+                    if !p.is_file() {
+                        continue;
+                    }
+                    let s = p.to_string_lossy().to_ascii_lowercase();
+                    // Prefer non-shim paths
+                    if s.contains(r"\chocolatey\bin\") {
+                        shim = Some(p);
+                        continue;
+                    }
+                    if s.ends_with("ffplay.exe") {
                         return Ok(p);
                     }
                 }
-                // Any first hit
-                if let Some(line) = text.lines().next() {
-                    let p = PathBuf::from(line.trim());
-                    if !p.as_os_str().is_empty() {
-                        return Ok(p);
-                    }
+                if let Some(p) = shim {
+                    return Ok(p);
                 }
             }
-        }
-        // Common Chocolatey location
-        let choco = PathBuf::from(r"C:\ProgramData\chocolatey\bin\ffplay.exe");
-        if choco.is_file() {
-            return Ok(choco);
         }
     }
 
@@ -198,7 +215,6 @@ fn resolve_ffplay() -> Result<PathBuf, String> {
         }
     }
 
-    // 3) Fall back to bare name (PATH search at spawn time).
     match Command::new("ffplay").arg("-version").output() {
         Ok(_) => Ok(PathBuf::from("ffplay")),
         Err(e) => Err(format!(
