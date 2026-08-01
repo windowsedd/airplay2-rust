@@ -258,22 +258,25 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
         labels.push("h264-dump");
     }
 
-    // ffplay is the most reliable *window* on Windows (video only).
+    // ffplay live window (video only). Needs real ffplay.exe on Windows.
     #[cfg(feature = "ffmpeg")]
     {
         match airplay_player::FFmpegPlayer::new() {
             Ok(p) => {
+                // File-mode fallback opens this path if stdin spawn fails.
+                p.set_dump_path(output);
                 parts.push(Box::new(p));
                 labels.push("ffmpeg/ffplay");
                 tracing::info!(
-                    "ffplay backend ready — a window titled 'airplay2-rust' should open (taskbar)"
+                    dump = %output,
+                    "ffplay backend ready — window 'airplay2-rust' opens after first SPS/frames"
                 );
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "ffplay unavailable; NO live video window. Install FFmpeg and put ffplay on PATH \
-                     (e.g. choco install ffmpeg). dump.h264 will still be written."
+                    "ffplay unavailable; NO live video window. Install FFmpeg (choco install ffmpeg). \
+                     dump.h264 will still be written if h264-dump is enabled."
                 );
             }
         }
