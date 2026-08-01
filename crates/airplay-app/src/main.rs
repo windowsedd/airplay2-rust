@@ -250,6 +250,7 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
     let mut parts: Vec<Box<dyn AirPlayConsumer>> = Vec::new();
     let mut labels: Vec<&'static str> = Vec::new();
 
+    // 1) Always dump for debugging (if feature on).
     #[cfg(feature = "h264-dump")]
     {
         let dump = airplay_player::H264Dump::new(output)
@@ -258,57 +259,66 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
         labels.push("h264-dump");
     }
 
-    // ffplay live window (video only). Needs real ffplay.exe on Windows.
-    #[cfg(feature = "ffmpeg")]
-    {
-        match airplay_player::FFmpegPlayer::new() {
-            Ok(p) => {
-                // File-mode fallback opens this path if stdin spawn fails.
-                p.set_dump_path(output);
-                parts.push(Box::new(p));
-                labels.push("ffmpeg/ffplay");
-                tracing::info!(
-                    dump = %output,
-                    "ffplay backend ready — window 'airplay2-rust' opens after first SPS/frames"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "ffplay unavailable; NO live video window. Install FFmpeg (choco install ffmpeg). \
-                     dump.h264 will still be written if h264-dump is enabled."
-                );
-            }
-        }
-    }
-    #[cfg(not(feature = "ffmpeg"))]
-    {
-        tracing::error!(
-            "binary built without --features ffmpeg; NO live window. Rebuild with default features."
-        );
-    }
-
+    // 2) GStreamer first for live video + ALAC/AAC-ELD audio (default feature).
     #[cfg(feature = "gstreamer")]
     {
         match airplay_player::GStreamerPlayer::new() {
             Ok(p) => {
                 parts.push(Box::new(p));
                 labels.push("gstreamer");
+                tracing::info!(
+                    "GStreamer backend ready — primary live window (video + ALAC/AAC-ELD)"
+                );
             }
-            Err(e) => tracing::warn!(error = %e, "GStreamer unavailable; no GStreamer window"),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "GStreamer init failed (is GStreamer 1.x installed and on PATH?). \
+                     Will try ffplay fallback if available."
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "gstreamer"))]
+    {
+        tracing::warn!(
+            "binary built without --features gstreamer; rebuild with default features for GStreamer"
+        );
+    }
+
+    // 3) ffplay as secondary video window / fallback.
+    #[cfg(feature = "ffmpeg")]
+    {
+        match airplay_player::FFmpegPlayer::new() {
+            Ok(p) => {
+                p.set_dump_path(output);
+                parts.push(Box::new(p));
+                labels.push("ffmpeg/ffplay");
+                tracing::info!(
+                    dump = %output,
+                    "ffplay backend ready (secondary / fallback video window)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ffplay unavailable (optional fallback). Primary path is GStreamer."
+                );
+            }
         }
     }
 
     if parts.is_empty() {
         bail!(
             "auto player: no backends available. Build with default features \
-             (h264-dump,gstreamer,ffmpeg) and install GStreamer + ffplay."
+             (includes gstreamer) and install GStreamer 1.x. \
+             Without GStreamer: cargo run --no-default-features --features \"h264-dump,ffmpeg\""
         );
     }
 
     tracing::info!(
         backends = %labels.join(" + "),
-        "player: auto (tee) — look for window title 'airplay2-rust'"
+        "player: auto (tee) — primary live UI is GStreamer when listed"
     );
     Ok(Arc::new(airplay_player::TeePlayer::new(parts)))
 }

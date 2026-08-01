@@ -18,6 +18,7 @@ refresh_rate = 60
 # fps = 30
 
 [player]
-# auto = dump.h264 + ffplay window
+# auto = GStreamer (primary live A/V) + dump.h264 + ffplay fallback
+# Also: gstreamer | ffmpeg | h264-dump | vlc
 implementation = "auto"
 output = "dump.h264"

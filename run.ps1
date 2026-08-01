@@ -1,23 +1,22 @@
 # airplay2-rust - Windows run helper
 #
-# Preferred (same as plain cargo run; player=auto):
-#   cargo run
+# Default: GStreamer + dump + ffplay (same as plain cargo run when GST is installed)
 #   .\run.ps1
+#   cargo run
 #
-# Release .exe into dist\:
+# Without GStreamer (ffplay + dump only):
+#   .\run.ps1 -NoGStreamer
+#
+# Release .exe:
 #   .\build-release.ps1
-#   .\dist\airplay-app.exe
-#
-# With GStreamer (needs GStreamer MSVC + pkg-config on PATH):
-#   .\run.ps1 -GStreamer
 #
 # Options:
-#   -GStreamer    build/run with --features gstreamer
+#   -NoGStreamer  omit gstreamer feature
 #   -BuildOnly    cargo build only
 #   -Config path  config.toml path
 
 param(
-    [switch]$GStreamer,
+    [switch]$NoGStreamer,
     [switch]$BuildOnly,
     [string]$Config = "config.toml"
 )
@@ -30,6 +29,10 @@ $chocoBin = "C:\ProgramData\chocolatey\bin"
 if (Test-Path $chocoBin) {
     $env:Path = "$chocoBin;" + $env:Path
 }
+$realFfplay = "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin"
+if (Test-Path $realFfplay) {
+    $env:Path = "$realFfplay;" + $env:Path
+}
 
 $gstRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
 if (-not $gstRoot) {
@@ -37,27 +40,28 @@ if (-not $gstRoot) {
 }
 
 $features = @("h264-dump", "ffmpeg")
-if ($GStreamer) {
-    if (-not (Test-Path $gstRoot)) {
-        Write-Error "GStreamer not found at '$gstRoot'. Install MSVC x86_64 runtime+dev, or set GSTREAMER_1_0_ROOT_MSVC_X86_64."
-    }
-    $gstBin = Join-Path $gstRoot "bin"
-    $gstPc = Join-Path $gstRoot "lib\pkgconfig"
-    # pkg-config.exe ships inside GStreamer bin on Windows
-    $env:Path = "$gstBin;" + $env:Path
-    $env:PKG_CONFIG_PATH = $gstPc
-    $env:GST_PLUGIN_PATH = (Join-Path $gstRoot "lib\gstreamer-1.0")
-    $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $gstRoot
-    $features += "gstreamer"
-    Write-Host "GStreamer enabled: $gstRoot" -ForegroundColor Cyan
-    Write-Host "  PATH += $gstBin (includes pkg-config.exe)" -ForegroundColor DarkGray
-    Write-Host "  PKG_CONFIG_PATH = $gstPc" -ForegroundColor DarkGray
+$useGst = -not $NoGStreamer
 
-    $pkg = Get-Command pkg-config -ErrorAction SilentlyContinue
-    if (-not $pkg) {
-        Write-Error "pkg-config.exe still not on PATH. Check $gstBin\pkg-config.exe exists."
+if ($useGst) {
+    if (-not (Test-Path $gstRoot)) {
+        Write-Host "GStreamer not found at '$gstRoot' - building without gstreamer feature." -ForegroundColor Yellow
+        Write-Host "Install MSVC x86_64 from https://gstreamer.freedesktop.org/download/" -ForegroundColor Yellow
+        $useGst = $false
+    } else {
+        $gstBin = Join-Path $gstRoot "bin"
+        $gstPc = Join-Path $gstRoot "lib\pkgconfig"
+        $env:Path = "$gstBin;" + $env:Path
+        $env:PKG_CONFIG_PATH = $gstPc
+        $env:GST_PLUGIN_PATH = (Join-Path $gstRoot "lib\gstreamer-1.0")
+        $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $gstRoot
+        $features += "gstreamer"
+        Write-Host "GStreamer enabled (default): $gstRoot" -ForegroundColor Cyan
+        $pkg = Get-Command pkg-config -ErrorAction SilentlyContinue
+        if (-not $pkg) {
+            Write-Error "pkg-config.exe not on PATH. Expected at $gstBin\pkg-config.exe"
+        }
+        Write-Host "  pkg-config: $($pkg.Source)" -ForegroundColor DarkGray
     }
-    Write-Host "  pkg-config: $($pkg.Source)" -ForegroundColor DarkGray
 }
 
 $feat = ($features -join ",")

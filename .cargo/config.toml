@@ -1,7 +1,15 @@
-# Workspace cargo aliases — plain `cargo run` already starts airplay-app
-# (see workspace default-members). These make intent explicit.
+# Workspace cargo config — plain `cargo run` builds airplay-app with GStreamer.
+#
+# Windows GStreamer: pkg-config.exe lives in GStreamer bin. These env vars apply
+# when you run cargo from this workspace (override by setting them yourself first).
+
 [alias]
-# cargo run-airplay  →  same as cargo run -p airplay-app
 run-airplay = "run -p airplay-app"
-# cargo build-airplay  →  release .exe with default features (auto player)
 build-airplay = "build -p airplay-app --release"
+
+[env]
+# Default MSVC x86_64 install path (GStreamer 1.x)
+GSTREAMER_1_0_ROOT_MSVC_X86_64 = { value = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64", force = false }
+PKG_CONFIG_PATH = { value = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\lib\\pkgconfig", force = false }
+# So build scripts find pkg-config.exe next to gstreamer-1.0.pc
+PATH = { value = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\bin", prepend = true, force = false }

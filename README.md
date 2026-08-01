@@ -48,7 +48,7 @@ AI / coding agents:
 
 ## Players
 
-Select the backend with `player.implementation` in `config.toml` (must match a **Cargo feature** built into the binary). Default app features are `h264-dump` + `ffmpeg` (no GStreamer / pkg-config). Use `implementation = "auto"` to tee **h264-dump + ffplay** (and GStreamer if that feature was compiled in).
+Select the backend with `player.implementation` in `config.toml` (must match a **Cargo feature** built into the binary). Default app features are **`h264-dump` + `ffmpeg` + `gstreamer`**. Use `implementation = "auto"` to tee **GStreamer (primary)** + dump + ffplay.
 
 ### GStreamer
 
@@ -88,7 +88,7 @@ Select the backend with `player.implementation` in `config.toml` (must match a *
 
 ## 播放器 / Players (繁體中文)
 
-在 `config.toml` 設定 `player.implementation`（須與編譯進 binary 的 **Cargo feature** 一致）。預設 feature 為 `h264-dump` + `ffmpeg`（不需 GStreamer / pkg-config）。`implementation = "auto"` 會同時使用 **h264-dump + ffplay**（若編譯時有開啟 gstreamer 也會一併使用）。
+在 `config.toml` 設定 `player.implementation`（須與編譯進 binary 的 **Cargo feature** 一致）。預設 feature 為 **`h264-dump` + `ffmpeg` + `gstreamer`**。`implementation = "auto"` 會以 **GStreamer 為主**（即時影音），並同時 dump + 可選 ffplay。
 
 ### GStreamer
 
@@ -132,28 +132,32 @@ Select the backend with `player.implementation` in `config.toml` (must match a *
 
 - Rust **1.70+** recommended (workspace uses edition 2021). Install via [rustup](https://rustup.rs/).
 
-### Default run / build (player = **auto**)
+### Default run / build (player = **auto**, **GStreamer** primary)
 
-Plain **`cargo run`** and the release **`.exe`** both default to **`player.implementation = "auto"`**:
-write `dump.h264` **and** open an **ffplay** window (install FFmpeg so `ffplay` is on `PATH`).  
-No GStreamer / pkg-config required.
+Plain **`cargo run`** defaults to features **`h264-dump` + `ffmpeg` + `gstreamer`** and  
+`player.implementation = "auto"`:
+
+1. **GStreamer** — primary live window (video + ALAC / AAC-ELD audio)  
+2. **h264-dump** — `dump.h264`  
+3. **ffplay** — optional secondary video window  
+
+Windows: GStreamer MSVC must be installed; `.cargo/config.toml` prepends its `bin` (pkg-config) and `PKG_CONFIG_PATH`. Or use:
 
 ```powershell
 cd F:\airplay2-rust
+.\run.ps1              # sets GStreamer env + cargo run (default)
+cargo run              # same features if .cargo/config.toml GST paths work
 
-# Dev (auto)
-cargo run
-
-# Release .exe into dist\ (auto)
-.\build-release.ps1
+.\build-release.ps1    # release .exe with GStreamer
 .\dist\airplay-app.exe
 
-# Same as cargo run, with optional GStreamer:
-.\run.ps1
-.\run.ps1 -GStreamer
+# Without GStreamer:
+.\run.ps1 -NoGStreamer
+cargo run --no-default-features --features "h264-dump,ffmpeg"
 ```
 
-You should see a log like: `player: auto (tee) — backends=h264-dump + ffmpeg/ffplay`.
+You should see a log like:  
+`player: auto (tee) — backends=h264-dump + gstreamer + ffmpeg/ffplay`
 
 ### System tray (taskbar)
 
