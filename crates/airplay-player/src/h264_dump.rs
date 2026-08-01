@@ -54,7 +54,7 @@ impl AirPlayConsumer for H264Dump {
         }
         match self.file.lock() {
             Ok(mut file) => {
-                if let Err(e) = file.write_all(data) {
+                if let Err(e) = file.write_all(data).and_then(|_| file.flush()) {
                     tracing::warn!(error = %e, "failed to write video dump");
                 }
             }

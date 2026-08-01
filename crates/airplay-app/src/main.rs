@@ -258,16 +258,31 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
         labels.push("h264-dump");
     }
 
-    // ffplay is the most reliable *window* on Windows.
+    // ffplay is the most reliable *window* on Windows (video only).
     #[cfg(feature = "ffmpeg")]
     {
         match airplay_player::FFmpegPlayer::new() {
             Ok(p) => {
                 parts.push(Box::new(p));
                 labels.push("ffmpeg/ffplay");
+                tracing::info!(
+                    "ffplay backend ready — a window titled 'airplay2-rust' should open (taskbar)"
+                );
             }
-            Err(e) => tracing::warn!(error = %e, "ffplay unavailable; no FFmpeg window"),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "ffplay unavailable; NO live video window. Install FFmpeg and put ffplay on PATH \
+                     (e.g. choco install ffmpeg). dump.h264 will still be written."
+                );
+            }
         }
+    }
+    #[cfg(not(feature = "ffmpeg"))]
+    {
+        tracing::error!(
+            "binary built without --features ffmpeg; NO live window. Rebuild with default features."
+        );
     }
 
     #[cfg(feature = "gstreamer")]

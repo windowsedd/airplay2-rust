@@ -1,89 +1,144 @@
 //! FFmpeg / ffplay subprocess player for live H.264 mirror video.
 //!
-//! Spawns `ffplay` with stdin as annex-B H.264 (`-f h264 -i -`). Requires
-//! `ffplay` on `PATH` and Cargo feature `ffmpeg`. Audio is not played.
+//! Spawns `ffplay` with stdin as annex-B H.264. On Windows we force a new console
+//! window group so the GUI is not swallowed by the cargo host, and we restart
+//! ffplay if it dies. Requires `ffplay` on `PATH` and Cargo feature `ffmpeg`.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use airplay_lib::{AudioStreamInfo, VideoStreamInfo};
 use airplay_server::AirPlayConsumer;
 
-/// Pipes decrypted H.264 to an `ffplay` child process.
+/// Pipes decrypted H.264 to an `ffplay` child process (live window).
 pub struct FFmpegPlayer {
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
+    last_restart: Mutex<Instant>,
+    frames: Mutex<u64>,
+    /// Full path to ffplay if resolved (avoids broken Chocolatey shims).
+    ffplay_path: PathBuf,
 }
 
 impl FFmpegPlayer {
-    /// Create a player. Does not spawn `ffplay` until the first video format event.
-    ///
-    /// Checks that `ffplay` is resolvable on `PATH` so misconfiguration fails early.
+    /// Create a player and **pre-start** ffplay so a window appears immediately.
     pub fn new() -> Result<Self, String> {
-        which_ffplay()?;
-        Ok(Self {
+        let ffplay_path = resolve_ffplay()?;
+        let player = Self {
             child: Mutex::new(None),
             stdin: Mutex::new(None),
-        })
+            last_restart: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            frames: Mutex::new(0),
+            ffplay_path,
+        };
+        // Open the window early (black until first NALs arrive).
+        if let Err(e) = player.ensure_started() {
+            tracing::warn!(error = %e, "pre-start ffplay failed; will retry on first frame");
+        }
+        Ok(player)
     }
 
-    fn spawn_ffplay() -> Result<(Child, ChildStdin), String> {
-        // Window title helps the user find the player among other windows.
-        let mut child = Command::new("ffplay")
-            .args([
-                "-window_title",
-                "airplay2-rust", // match GStreamer window name
-                "-fflags",
-                "nobuffer+discardcorrupt",
-                "-flags",
-                "low_delay",
-                "-framedrop",
-                "-sync",
-                "ext",
-                "-f",
-                "h264",
-                "-probesize",
-                "32768",
-                "-analyzeduration",
-                "0",
-                "-i",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()) // avoid spam; use dump.h264 if playback fails
-            .spawn()
-            .map_err(|e| {
-                format!(
-                    "failed to spawn ffplay (is FFmpeg/ffplay on PATH?): {e}"
-                )
-            })?;
+    fn spawn_ffplay(&self) -> Result<(Child, ChildStdin), String> {
+        let mut cmd = Command::new(&self.ffplay_path);
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-window_title",
+            "airplay2-rust",
+            "-alwaysontop",
+            "-fflags",
+            "nobuffer+discardcorrupt+genpts",
+            "-flags",
+            "low_delay",
+            "-framedrop",
+            "-strict",
+            "experimental",
+            "-f",
+            "h264",
+            // Wait for SPS/PPS + a few frames before giving up probe.
+            "-probesize",
+            "2000000",
+            "-analyzeduration",
+            "2000000",
+            "-i",
+            "pipe:0",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+        // Windows: ensure a visible process/window (not attached only to cargo).
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB (best-effort)
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "failed to spawn ffplay at {}: {e}",
+                self.ffplay_path.display()
+            )
+        })?;
 
         let stdin = child
             .stdin
             .take()
             .ok_or_else(|| "ffplay stdin not piped".to_string())?;
-        tracing::info!("ffplay window started (title: airplay2-rust)");
+
+        tracing::info!(
+            path = %self.ffplay_path.display(),
+            "ffplay window started (title: airplay2-rust) — look for it on the taskbar"
+        );
         Ok((child, stdin))
     }
 
     fn ensure_started(&self) -> Result<(), String> {
-        let mut child_guard = self
-            .child
-            .lock()
-            .map_err(|e| format!("child mutex poisoned: {e}"))?;
-        if child_guard.is_some() {
-            return Ok(());
+        // Restart if the previous process died.
+        if let Ok(mut child_guard) = self.child.lock() {
+            if let Some(child) = child_guard.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        tracing::warn!(
+                            ?status,
+                            "ffplay exited unexpectedly; will restart"
+                        );
+                        *child_guard = None;
+                        if let Ok(mut s) = self.stdin.lock() {
+                            *s = None;
+                        }
+                    }
+                    Ok(None) => return Ok(()), // still running
+                    Err(e) => tracing::warn!(error = %e, "ffplay try_wait failed"),
+                }
+            }
+            if child_guard.is_some() {
+                return Ok(());
+            }
         }
-        let (child, stdin) = Self::spawn_ffplay()?;
-        *child_guard = Some(child);
-        let mut stdin_guard = self
-            .stdin
-            .lock()
-            .map_err(|e| format!("stdin mutex poisoned: {e}"))?;
-        *stdin_guard = Some(stdin);
-        tracing::info!("ffplay started (H.264 annex-B on stdin)");
+
+        // Rate-limit restarts.
+        if let Ok(mut t) = self.last_restart.lock() {
+            if t.elapsed() < Duration::from_millis(500) {
+                return Err("ffplay restart throttled".into());
+            }
+            *t = Instant::now();
+        }
+
+        let (child, stdin) = self.spawn_ffplay()?;
+        if let Ok(mut g) = self.child.lock() {
+            *g = Some(child);
+        }
+        if let Ok(mut g) = self.stdin.lock() {
+            *g = Some(stdin);
+        }
         Ok(())
     }
 
@@ -101,11 +156,51 @@ impl FFmpegPlayer {
     }
 }
 
-fn which_ffplay() -> Result<(), String> {
+/// Prefer a real `ffplay.exe` over a broken shim when possible.
+fn resolve_ffplay() -> Result<PathBuf, String> {
+    // 1) Try PATH via `where` on Windows / `which` elsewhere.
+    #[cfg(windows)]
+    {
+        if let Ok(out) = Command::new("where").arg("ffplay").output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let p = PathBuf::from(line.trim());
+                    if p.extension().and_then(|e| e.to_str()) == Some("exe") && p.is_file() {
+                        return Ok(p);
+                    }
+                }
+                // Any first hit
+                if let Some(line) = text.lines().next() {
+                    let p = PathBuf::from(line.trim());
+                    if !p.as_os_str().is_empty() {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        // Common Chocolatey location
+        let choco = PathBuf::from(r"C:\ProgramData\chocolatey\bin\ffplay.exe");
+        if choco.is_file() {
+            return Ok(choco);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(out) = Command::new("which").arg("ffplay").output() {
+            if out.status.success() {
+                let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+                if p.is_file() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+
+    // 3) Fall back to bare name (PATH search at spawn time).
     match Command::new("ffplay").arg("-version").output() {
-        Ok(out) if out.status.success() || out.status.code() == Some(0) => Ok(()),
-        // Some builds print version to stderr and exit 0; accept any spawn that runs.
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(PathBuf::from("ffplay")),
         Err(e) => Err(format!(
             "ffplay not found on PATH (install FFmpeg and ensure ffplay is available): {e}"
         )),
@@ -137,11 +232,37 @@ impl AirPlayConsumer for FFmpegPlayer {
             tracing::error!(error = %e, "could not start ffplay for video push");
             return;
         }
+
+        let n = {
+            let mut f = self.frames.lock().unwrap_or_else(|e| e.into_inner());
+            *f += 1;
+            *f
+        };
+        if n == 1 {
+            tracing::info!(
+                bytes = data.len(),
+                "first H.264 annex-B chunk → ffplay (window title: airplay2-rust)"
+            );
+        } else if n % 120 == 0 {
+            tracing::info!(n, bytes = data.len(), "ffplay push H.264");
+        }
+
         match self.stdin.lock() {
             Ok(mut guard) => {
                 if let Some(stdin) = guard.as_mut() {
                     if let Err(e) = stdin.write_all(data).and_then(|_| stdin.flush()) {
-                        tracing::warn!(error = %e, "failed to write H.264 to ffplay stdin");
+                        tracing::warn!(
+                            error = %e,
+                            "failed to write H.264 to ffplay stdin (process may have died)"
+                        );
+                        // Drop stdin so ensure_started restarts next time.
+                        *guard = None;
+                        if let Ok(mut c) = self.child.lock() {
+                            if let Some(mut ch) = c.take() {
+                                let _ = ch.kill();
+                                let _ = ch.wait();
+                            }
+                        }
                     }
                 }
             }
@@ -151,6 +272,9 @@ impl AirPlayConsumer for FFmpegPlayer {
 
     fn on_video_src_disconnect(&self) {
         tracing::info!("video source disconnected; stopping ffplay");
+        if let Ok(mut f) = self.frames.lock() {
+            *f = 0;
+        }
         self.stop_process();
     }
 
@@ -158,9 +282,7 @@ impl AirPlayConsumer for FFmpegPlayer {
         tracing::info!(?info, "audio format (ignored by ffmpeg/ffplay video-only backend)");
     }
 
-    fn on_audio(&self, _data: &[u8]) {
-        // Video-only backend; audio not piped to ffplay.
-    }
+    fn on_audio(&self, _data: &[u8]) {}
 
     fn on_audio_src_disconnect(&self) {
         tracing::debug!("audio source disconnected (ffmpeg backend ignores audio)");
@@ -178,10 +300,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_requires_ffplay_or_errors_clearly() {
-        // On CI/dev machines with FFmpeg installed this succeeds; without it, error mentions PATH.
-        match FFmpegPlayer::new() {
-            Ok(_) => {}
+    fn resolve_or_errors_clearly() {
+        match resolve_ffplay() {
+            Ok(p) => {
+                assert!(!p.as_os_str().is_empty());
+            }
             Err(e) => {
                 assert!(
                     e.contains("ffplay") || e.contains("PATH"),
