@@ -1,11 +1,20 @@
 [airplay]
 server_name = "airplay2-rust"
-# Quality: advertise high res so the phone uses a higher bitrate (no bitrate key exists).
-width = 1920
-height = 1080
-fps = 60
+# Preview quality: low | medium | high | ultra | custom (real size, not simulated bitrate)
+quality = "high"
 refresh_rate = 60
+# custom only:
+# width = 1170
+# height = 2532
+# fps = 60
 
 [player]
 implementation = "auto"
 output = "dump.h264"
+preview_mode = "balanced"
+hardware_decode = true
+# Legacy orientation controls for ffplay/processed renderers. Direct GStreamer
+# preview preserves the encoded frame and ignores crop/rotation processing.
+auto_rotate = true
+rotate = "auto"
+detect_game = true

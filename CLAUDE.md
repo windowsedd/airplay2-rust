@@ -11,6 +11,7 @@ This file exists so Claude discovers the repo rules quickly; **AGENTS.md is the 
 ## Quick context
 
 - **What:** Rust AirPlay *receiver* (mirror + media), ported from `java-airplay-2open`.
+- **Platforms:** Windows primary; Linux optional; **no macOS receiver** build/run.
 - **Why:** Learning / research only — not an Apple product.
 - **Run with window:**  
   `cargo run -p airplay-app --features gstreamer -- --config config.toml`  

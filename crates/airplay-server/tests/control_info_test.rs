@@ -1,6 +1,6 @@
 //! Integration tests for the AirPlay control server (GET /info, pair-setup).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use airplay_lib::{AudioStreamInfo, VideoStreamInfo};
 use airplay_server::{AirPlayConfig, AirPlayConsumer, AirPlayServer};
@@ -16,6 +16,28 @@ impl AirPlayConsumer for NoopConsumer {
     fn on_audio_format(&self, _info: &AudioStreamInfo) {}
     fn on_audio(&self, _data: &[u8]) {}
     fn on_audio_src_disconnect(&self) {}
+}
+
+#[derive(Default)]
+struct RecordingVolumeConsumer {
+    volume_db: Mutex<Option<f64>>,
+}
+
+impl AirPlayConsumer for RecordingVolumeConsumer {
+    fn on_video_format(&self, _info: &VideoStreamInfo) {}
+    fn on_video(&self, _data: &[u8]) {}
+    fn on_video_src_disconnect(&self) {}
+    fn on_audio_format(&self, _info: &AudioStreamInfo) {}
+    fn on_audio(&self, _data: &[u8]) {}
+    fn on_audio_src_disconnect(&self) {}
+
+    fn on_volume(&self, volume_db: f64) {
+        *self.volume_db.lock().expect("volume lock") = Some(volume_db);
+    }
+
+    fn volume(&self) -> Option<f64> {
+        *self.volume_db.lock().expect("volume lock")
+    }
 }
 
 async fn read_http_like_response(stream: &mut TcpStream) -> Vec<u8> {
@@ -133,5 +155,86 @@ async fn unknown_path_returns_404() {
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("RTSP/1.0 404"), "got: {text}");
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn volume_set_parameter_updates_consumer_and_get_reports_it() {
+    let consumer = Arc::new(RecordingVolumeConsumer::default());
+    let mut server = AirPlayServer::new(AirPlayConfig::default(), consumer.clone());
+    server.start().await.expect("start server");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port()))
+        .await
+        .expect("connect");
+    let body = "volume: -20.000000\r\n";
+    let request = format!(
+        "SET_PARAMETER /stream RTSP/1.0\r\n\
+CSeq: 10\r\n\
+Content-Type: text/parameters\r\n\
+Content-Length: {}\r\n\
+\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write SET_PARAMETER");
+    let response = read_http_like_response(&mut stream).await;
+    assert!(String::from_utf8_lossy(&response).starts_with("RTSP/1.0 200"));
+    assert_eq!(
+        *consumer.volume_db.lock().expect("volume lock"),
+        Some(-20.0)
+    );
+
+    stream
+        .write_all(
+            b"GET_PARAMETER /stream RTSP/1.0\r\n\
+CSeq: 11\r\n\
+Content-Type: text/parameters\r\n\
+Content-Length: 8\r\n\
+\r\n\
+volume\r\n",
+        )
+        .await
+        .expect("write GET_PARAMETER");
+    let response = read_http_like_response(&mut stream).await;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response headers");
+    assert_eq!(&response[header_end + 4..], b"volume: -20.000000\r\n");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn volume_set_parameter_ignores_unrelated_and_invalid_values() {
+    let consumer = Arc::new(RecordingVolumeConsumer::default());
+    let mut server = AirPlayServer::new(AirPlayConfig::default(), consumer.clone());
+    server.start().await.expect("start server");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port()))
+        .await
+        .expect("connect");
+    for (cseq, body) in [
+        (20, "progress: 1/2/3\r\n"),
+        (21, "volume: not-a-number\r\n"),
+        (22, "volume: NaN\r\n"),
+    ] {
+        let request = format!(
+            "SET_PARAMETER /stream RTSP/1.0\r\nCSeq: {cseq}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write SET_PARAMETER");
+        let response = read_http_like_response(&mut stream).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("RTSP/1.0 200"));
+    }
+
+    assert_eq!(*consumer.volume_db.lock().expect("volume lock"), None);
     server.stop().await;
 }

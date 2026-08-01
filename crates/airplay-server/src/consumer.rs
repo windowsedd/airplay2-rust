@@ -18,9 +18,22 @@ pub trait AirPlayConsumer: Send + Sync {
     fn on_video(&self, data: &[u8]);
     fn on_video_src_disconnect(&self);
 
+    /// Stream pixel size from type-1 (SPS/PPS) headers — used for auto portrait rotate.
+    /// Default no-op.
+    fn on_video_size(&self, _width: u32, _height: u32) {}
+
     fn on_audio_format(&self, info: &AudioStreamInfo);
     fn on_audio(&self, data: &[u8]);
     fn on_audio_src_disconnect(&self);
+
+    /// AirPlay sender volume in decibels (`0.0` = unity, `-144.0` = mute).
+    /// Default no-op for consumers without audio playback.
+    fn on_volume(&self, _volume_db: f64) {}
+
+    /// Current AirPlay sender volume in decibels, when supported.
+    fn volume(&self) -> Option<f64> {
+        None
+    }
 
     /// HLS / media playlist hooks — default no-ops.
     fn on_media_playlist(&self, _playlist_uri: &str) {}

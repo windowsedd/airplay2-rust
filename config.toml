@@ -2,23 +2,34 @@
 # Name shown on the iPhone Screen Mirroring list
 server_name = "airplay2-rust"
 
-# --- Quality (no separate "bitrate" on the receiver) ---
-# The iPhone encodes H.264 based on what we advertise here:
-#   larger width/height  => typically higher bitrate / sharper picture
-#   higher fps           => smoother motion (up to what Wi-Fi allows)
-# After changing these: stop the app, restart, then disconnect & re-mirror on the phone.
-width = 1920
-height = 1080
-fps = 60
+# --- Preview quality (real encode, NOT simulated) ---
+# The receiver cannot invent sharpness. The iPhone picks H.264 bitrate from the
+# display size we advertise. Larger size ≈ sharper / heavier Wi‑Fi.
+#
+# quality presets (portrait-first for home UI):
+#   low    =  720 x 1280 @ 30   (smooth / weak Wi‑Fi)
+#   medium = 1080 x 1920 @ 60
+#   high   = 1170 x 2532 @ 60   ← default high-quality preview
+#   ultra  = 1290 x 2796 @ 60   (max; needs strong Wi‑Fi + phone)
+#   custom = use width / height / fps below
+quality = "custom"
 refresh_rate = 60
 
-# Lower quality / less Wi-Fi load (uncomment if stream is choppy):
-# width = 1280
-# height = 720
-# fps = 30
+# Only used when quality = "custom":
+ width = 1280
+ height = 720
+ fps = 60
+
+# After changing quality: stop app, restart, then disconnect & re-mirror on the phone.
 
 [player]
-# auto = GStreamer live window + dump.h264 (ffplay only if GStreamer fails — one window)
-# Also: gstreamer | ffmpeg | h264-dump | vlc
-implementation = "auto"
+implementation = "gstreamer"
 output = "dump.h264"
+preview_mode = "low-latency"
+hardware_decode = true
+
+# Legacy orientation controls for ffplay/processed renderers. The direct
+# GStreamer D3D11 preview intentionally bypasses crop/rotation processing.
+auto_rotate = true
+rotate = "auto"
+detect_game = true

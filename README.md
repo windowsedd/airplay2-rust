@@ -53,9 +53,37 @@ Select the backend with `player.implementation` in `config.toml` (must match a *
 ### GStreamer
 
 - Supports **video and audio** streams (**ALAC** + **AAC-ELD**).
-- Requires [GStreamer](https://gstreamer.freedesktop.org/download/) 1.x installed (plugins for `h264parse`, `avdec_h264`, `avdec_alac` / `avdec_aac`, `autovideosink`, etc.).
-- On Windows, the Rust crates need **`pkg-config`** (ships in GStreamer’s `bin`) and `PKG_CONFIG_PATH` — easiest: `.\run.ps1 -GStreamer`.
+- Windows preview prefers `d3d11h264dec` + `d3d11videosink`, preserving the sender's resolution and aspect ratio without re-encoding.
+- Decoder fallback order is `d3d11h264dec` → `avdec_h264` → `decodebin`; the sink falls back from `d3d11videosink` to `autovideosink`.
+- Requires [GStreamer](https://gstreamer.freedesktop.org/download/) 1.20+ installed (base/good/bad/libav plugins for `h264parse`, D3D11, software decode, audio decode, and automatic sinks).
+- On Windows, the Rust crates need **`pkg-config`** (ships in GStreamer's `bin`) and `PKG_CONFIG_PATH` — easiest: `.\run.ps1 -GStreamer`.
 - Config: `implementation = "gstreamer"` with `--features gstreamer`.
+
+Preview configuration:
+
+```toml
+[player]
+implementation = "gstreamer"
+preview_mode = "balanced"
+hardware_decode = true
+```
+
+| Preview mode | Behavior |
+|--------------|----------|
+| `quality` | 8-buffer non-leaky downstream queue; bounded appsrc drops newest input if saturated; clock-synchronized output |
+| `balanced` | 3-buffer downstream-leaky queue and bounded appsrc; clock-synchronized output (default) |
+| `low-latency` | 2-buffer downstream-leaky queue and bounded appsrc; immediate output (`sync=false`) |
+
+Inspect the required Windows elements:
+
+```powershell
+gst-inspect-1.0 d3d11h264dec
+gst-inspect-1.0 d3d11videosink
+gst-inspect-1.0 h264parse
+gst-inspect-1.0 avdec_h264
+```
+
+The direct preview does not encode, crop, extract, or force a fixed resolution. Window resizing is handled by the video sink/GPU with aspect-ratio preservation. Receiver settings cannot create detail beyond the H.264 stream sent by the AirPlay sender.
 
 ### FFmpeg
 
@@ -80,7 +108,7 @@ Select the backend with `player.implementation` in `config.toml` (must match a *
 
 | Backend | Video | Audio | Needs | Stability |
 |---------|-------|-------|-------|-----------|
-| **GStreamer** | Yes | ALAC + AAC-ELD | GStreamer 1.x (+ pkg-config to **build**) | Best for live A/V |
+| **GStreamer** | Yes | ALAC + AAC-ELD | GStreamer 1.20+ (+ pkg-config to **build**) | Best for live A/V |
 | **FFmpeg** | Yes (`ffplay`) | No (default path) | `ffplay` on `PATH` | Good for video window |
 | **VLC** | Yes | No | VLC on `PATH` | Stops after a few seconds |
 | **h264-dump** | File only | No | None | Stable dump for analysis |
@@ -93,7 +121,7 @@ Select the backend with `player.implementation` in `config.toml` (must match a *
 ### GStreamer
 
 - 支援**視訊與音訊**流（**ALAC** + **AAC-ELD**）。
-- 需安裝 [GStreamer](https://gstreamer.freedesktop.org/download/) 1.x（含 `h264parse`、`avdec_h264`、`avdec_alac` / `avdec_aac`、`autovideosink` 等外掛）。
+- 需安裝 [GStreamer](https://gstreamer.freedesktop.org/download/) 1.20+（含 `h264parse`、`avdec_h264`、`avdec_alac` / `avdec_aac`、`autovideosink` 等外掛）。
 - Windows 編譯 Rust binding 需要 **`pkg-config`**（位於 GStreamer 的 `bin`）與 `PKG_CONFIG_PATH` — 建議：`.\run.ps1 -GStreamer`。
 - 設定：`implementation = "gstreamer"`，並以 `--features gstreamer` 編譯。
 
@@ -120,7 +148,7 @@ Select the backend with `player.implementation` in `config.toml` (must match a *
 
 | 後端 | 視訊 | 音訊 | 需求 | 穩定性 |
 |------|------|------|------|--------|
-| **GStreamer** | 有 | ALAC + AAC-ELD | GStreamer 1.x（編譯需 pkg-config） | 即時影音較佳 |
+| **GStreamer** | 有 | ALAC + AAC-ELD | GStreamer 1.20+（編譯需 pkg-config） | 即時影音較佳 |
 | **FFmpeg** | 有（`ffplay`） | 無（預設路徑） | `PATH` 中有 `ffplay` | 視訊視窗可用 |
 | **VLC** | 有 | 無 | `PATH` 中有 VLC | 數秒後易停 |
 | **h264-dump** | 僅檔案 | 無 | 無 | 除錯用穩定 |
@@ -203,19 +231,26 @@ File dump only:
 cargo run -p airplay-app --no-default-features --features h264-dump
 ```
 
-### Firewall / mDNS (all OSes)
+### Supported platforms (receiver)
+
+| Platform | Status |
+|----------|--------|
+| **Windows** | **Primary** — build, run, and real-device acceptance target |
+| **Linux** | Optional — build/run documented; smoke as feasible |
+| **macOS** | **Not supported** as a receiver build/run target. iPhone / iPad / Mac can still **send** Screen Mirroring **to** a Windows (or Linux) receiver. |
+
+### Firewall / mDNS
 
 The receiver advertises `_airplay._tcp` and `_raop._tcp` via mDNS (UDP **5353** multicast) and listens on a dynamic TCP control port (logged at start) plus media ports negotiated in SETUP.
 
 | OS | Notes |
 |----|--------|
-| **Windows** | Allow the `airplay-app` binary through Windows Defender Firewall (Private networks). Multicast/mDNS may need “File and Printer Sharing” style LAN access. Run from an elevated shell only if UDP 5353 bind fails. |
-| **Linux** | Ensure firewall (ufw/firewalld/nftables) allows UDP 5353 and the TCP control/media ports on the LAN interface. Some setups need `avahi-daemon` not conflicting; this stack uses `mdns-sd` directly. |
-| **macOS** | Grant **Local Network** permission when prompted. System Settings → Privacy & Security → Local Network. Blocked multicast = device never sees the receiver. |
+| **Windows** (**primary**) | Allow the `airplay-app` binary through Windows Defender Firewall (Private networks). Multicast/mDNS may need “File and Printer Sharing” style LAN access. Run from an elevated shell only if UDP 5353 bind fails. |
+| **Linux** | Optional. Ensure firewall allows UDP 5353 and TCP control/media ports. |
 
 ### GStreamer (`--features gstreamer`)
 
-Needs **GStreamer 1.x** with base/good/libav (or equivalent) plugins so `h264parse`, `avdec_h264`, `videoconvert`, `autovideosink`, and for audio `avdec_alac` / `avdec_aac` are available.
+Needs **GStreamer 1.20+** with base/good/libav (or equivalent) plugins so `h264parse`, `avdec_h264`, `autovideosink`, and for audio `avdec_alac` / `avdec_aac` are available. The direct video path does not use `videoconvert`.
 
 **Windows**
 
@@ -233,7 +268,7 @@ $env:PKG_CONFIG_PATH = "C:\Program Files\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
 cargo build -p airplay-app --features gstreamer
 ```
 
-**Linux (Debian/Ubuntu)**
+**Linux (Debian/Ubuntu)** — optional
 
 ```bash
 sudo apt install \
@@ -241,13 +276,6 @@ sudo apt install \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-libav \
   gstreamer1.0-tools pkg-config
-cargo build -p airplay-app --features gstreamer
-```
-
-**macOS (Homebrew)**
-
-```bash
-brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav pkg-config
 cargo build -p airplay-app --features gstreamer
 ```
 
@@ -259,7 +287,6 @@ Install FFmpeg so **`ffplay` is on `PATH`**.
 |----|---------|
 | Windows | [gyan.dev builds](https://www.gyan.dev/ffmpeg/builds/) or chocolatey `choco install ffmpeg` |
 | Linux | `sudo apt install ffmpeg` |
-| macOS | `brew install ffmpeg` |
 
 ### VLC (`--features vlc`)
 
@@ -269,7 +296,6 @@ Install VLC so **`vlc` or `cvlc` is on `PATH`**. Live stdin H.264 demux is **bes
 |----|---------|
 | Windows | Install [VLC](https://www.videolan.org/) and add install dir to `PATH` |
 | Linux | `sudo apt install vlc` |
-| macOS | `brew install vlc` |
 
 ## Build
 
@@ -284,7 +310,7 @@ cargo test --workspace
 | Feature | Backend | System requirement |
 |---------|---------|-------------------|
 | `h264-dump` (**default**) | Write raw H.264 to a file | none |
-| `gstreamer` | Live window via GStreamer | GStreamer 1.x + plugins + pkg-config |
+| `gstreamer` | Live window via GStreamer | GStreamer 1.20+ + plugins + pkg-config |
 | `ffmpeg` | Pipe H.264 to `ffplay` | FFmpeg (`ffplay` on `PATH`) |
 | `vlc` | Best-effort VLC stdin | VLC CLI (`vlc` / `cvlc` on `PATH`) |
 
@@ -304,7 +330,7 @@ cargo build -p airplay-app --features "gstreamer,ffmpeg,vlc,h264-dump"
 ```
 
 `cargo build -p airplay-player` without extra features always works (h264-dump only).
-Enabling `--features gstreamer` requires GStreamer 1.x development files to link.
+Enabling `--features gstreamer` requires GStreamer 1.20+ development files to link.
 
 ## Run the receiver (`airplay-app`)
 
@@ -335,6 +361,8 @@ Default config (when no `config.toml` is found):
 | | `width` / `height` / `fps` | `1280` / `720` / `24` |
 | `[player]` | `implementation` | `auto` |
 | | `output` | `dump.h264` |
+| | `preview_mode` | `balanced` |
+| | `hardware_decode` | `true` |
 
 Supported `player.implementation` values (must match a compiled feature):
 
@@ -376,6 +404,10 @@ fps = 60
 implementation = "auto"
 # Used by h264-dump / auto
 output = "dump.h264"
+# quality | balanced | low-latency
+preview_mode = "balanced"
+# Prefer d3d11h264dec on Windows, then fall back to software/automatic decode.
+hardware_decode = true
 ```
 
 
@@ -471,10 +503,12 @@ Limits: discovery/control/encrypt are present; full mirror **sender** (media soc
 | **`overflow-checks = false`** | Root `Cargo.toml` disables integer overflow checks in `[profile.dev]` and `[profile.test]`. FairPlay **OmgHax / HandGarble** was ported for **Java-style silent `i32` wraparound**; enabling overflow checks breaks vector parity. This is **known technical debt** — prefer isolating wrap semantics (e.g. `wrapping_*` / explicit casts) and re-enabling checks later. |
 | **mDNS permissions** | Advertise/browse soft-fail when UDP 5353 or multicast is blocked; device may not list the receiver. See firewall/mDNS notes above. |
 | **Audio complexity** | ALAC / AAC-ELD decrypt and player paths exist; A/V sync, buffering, and edge formats are less battle-tested than video dump. |
+| **Video timing** | The server does not yet expose a verified AirPlay video clock/timescale. GStreamer uses arrival timestamps (`do-timestamp=true`) rather than invented PTS/durations. |
+| **Windows live validation** | D3D11 elements and feature compilation can be checked automatically, but high-quality preview remains unproven until a real sender is mirrored on Windows. |
 | **VLC backend** | Best-effort stdin H.264; often flaky vs GStreamer/FFmpeg. |
 | **Default player** | App default is `auto` (`h264-dump` + `ffplay`). GStreamer is optional (`--features gstreamer` / `.\run.ps1 -GStreamer`) for ALAC/AAC-ELD live audio. |
 | **Client** | Discovery + pair + encrypt primitives; not a full AirPlay sender application. |
-| **Platforms** | Intended for **Windows / Linux / macOS**. Real-device mirror acceptance is manual on at least one OS. |
+| **Platforms** | Receiver: **Windows primary**, Linux optional. **macOS is not a supported build/run target.** iOS/macOS remain senders only. Real-device mirror acceptance is manual on Windows. |
 
 ## Docs
 

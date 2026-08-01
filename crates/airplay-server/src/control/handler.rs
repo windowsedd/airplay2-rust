@@ -350,12 +350,24 @@ impl ControlHandler {
     }
 
     fn handle_get_parameter(&self, request: &ControlRequest) -> ControlResponse {
+        let volume_db = self.consumer.volume().unwrap_or(0.0).clamp(-144.0, 0.0);
         ControlResponse::ok_rtsp()
             .with_cseq_from(request)
-            .with_body(b"volume: 0.000000\r\n".to_vec())
+            .with_body(format!("volume: {volume_db:.6}\r\n").into_bytes())
     }
 
     fn handle_set_parameter(&self, request: &ControlRequest) -> ControlResponse {
+        if request.header("Content-Type").is_some_and(|content_type| {
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/parameters"))
+        }) {
+            if let Some(volume_db) = parse_volume_parameter(&request.body) {
+                debug!(volume_db, "AirPlay sender volume");
+                self.consumer.on_volume(volume_db);
+            }
+        }
         ControlResponse::ok_rtsp()
             .with_cseq_from(request)
             .header("Audio-Jack-Status", "connected; type=analog")
@@ -380,4 +392,18 @@ impl ControlHandler {
 
 fn ok_rtsp(request: &ControlRequest) -> ControlResponse {
     ControlResponse::ok_rtsp().with_cseq_from(request)
+}
+
+fn parse_volume_parameter(body: &[u8]) -> Option<f64> {
+    std::str::from_utf8(body)
+        .ok()?
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| {
+            if !name.trim().eq_ignore_ascii_case("volume") {
+                return None;
+            }
+            let volume_db = value.trim().parse::<f64>().ok()?;
+            volume_db.is_finite().then(|| volume_db.clamp(-144.0, 0.0))
+        })
 }

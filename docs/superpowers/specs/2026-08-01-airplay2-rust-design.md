@@ -14,11 +14,11 @@
   - server (control + video/audio)
   - all player backends (GStreamer, FFmpeg, VLC, h264-dump)
   - client (sender / discovery path)
-- Support **Windows, Linux, and macOS**.
+- Support **Windows** as the primary receiver build/run target; **Linux** optional. **macOS is not a supported receiver build/run target** (iOS/macOS remain AirPlay *senders* only).
 - Default live playback via **GStreamer**.
 - Acceptance requires **both**:
   1. Ported Java **unit/vector tests** pass (crypto/protocol fixtures).
-  2. **Real-device** screen mirroring works with GStreamer on at least one platform; other platforms build and are documented with a smoke path.
+  2. **Real-device** screen mirroring works with GStreamer on **Windows** (primary); Linux smoke as feasible.
 
 ### Non-goals (v1 cut line)
 
@@ -171,16 +171,17 @@ RTSP TEARDOWN → stop media → on_*_disconnect → session cleanup
 
 **Invariant:** Pairing shared secret, ekey/eiv, and stream connection id handling must match Java semantics so existing encrypted fixtures and live clients interoperate.
 
-## 5. Cross-platform (Windows / Linux / macOS)
+## 5. Cross-platform (Windows primary / Linux optional)
 
 | Area | Policy |
 |------|--------|
 | I/O | Tokio only for async networking |
-| mDNS | Prefer one cross-platform stack; document multicast/firewall and macOS Local Network permission |
-| GStreamer | System GStreamer 1.x required for default player; README install steps per OS |
+| mDNS | Prefer one stack that works on Windows and Linux; document multicast/firewall |
+| GStreamer | System GStreamer 1.x required for default player; README install steps for Windows (+ optional Linux) |
 | Optional players | Feature-gated; may be weaker on some OSes |
 | Crypto core | Pure Rust; no OpenSSL required for pairing/FairPlay path |
-| CI | Prefer Linux (and where available Windows/macOS) `cargo test` for lib; device tests remain manual |
+| CI | Prefer Windows or Linux `cargo test` for lib; device tests remain manual on Windows |
+| macOS | **Out of scope** for receiver build/docs/CI |
 
 ## 6. Error handling
 
@@ -202,15 +203,15 @@ RTSP TEARDOWN → stop media → on_*_disconnect → session cleanup
 
 ### 7.2 Manual / device
 
-- Real iPhone or iPad screen mirror → GStreamer display on primary dev OS.  
-- Checklist for Linux and macOS (or Windows if primary is another): discoverable, pair, video visible.  
+- Real iPhone or iPad screen mirror → GStreamer display on **Windows** (primary).  
+- Optional Linux: discoverable, pair, video visible when convenient.  
 - Client smoke: discover and exercise control against local receiver when both are ready.
 
 ### 7.3 Definition of done (full parity)
 
 1. Ported vector/unit tests green in CI or local `cargo test`.  
-2. Real-device mirror works with GStreamer on at least one of Win/Linux/macOS.  
-3. Remaining OSes: project builds; run instructions documented; smoke as feasible.  
+2. Real-device mirror works with GStreamer on **Windows**.  
+3. Linux: project builds; run instructions documented; smoke as feasible (macOS receiver out of scope).  
 4. All four player backends exist; h264-dump and GStreamer verified; FFmpeg/VLC at least compile + basic smoke.  
 5. Client crate present with discovery/control path and documented limits.
 
@@ -256,7 +257,7 @@ implementation = "gstreamer"  # gstreamer | ffmpeg | vlc | h264-dump
 |-------|----------|
 | Scope | Full parity (lib, server, all players, client) |
 | Architecture | A — multi-crate workspace |
-| Platforms | Windows + Linux + macOS |
+| Platforms | Windows primary + Linux optional; macOS receiver not supported |
 | Default player | GStreamer |
 | Acceptance | Real-device mirror + Java test vectors |
 

@@ -8,6 +8,8 @@ Instructions for AI coding agents (Grok, Claude Code, Cursor, Codex, etc.) worki
 
 Rust port of **java-airplay-2open** (AirPlay **receiver**: screen mirror + media). Educational / research only; not affiliated with Apple.
 
+**Platforms:** **Windows** primary receiver target; **Linux** optional. **macOS is not a supported build/run target** for the receiver (iOS/macOS remain AirPlay *senders* only).
+
 | Path | Purpose |
 |------|---------|
 | `crates/airplay-lib` | Pairing, FairPlay/OmgHax, RTSP setup, decrypt, Bonjour helpers |

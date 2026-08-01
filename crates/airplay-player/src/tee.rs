@@ -36,6 +36,12 @@ impl AirPlayConsumer for TeePlayer {
         }
     }
 
+    fn on_video_size(&self, width: u32, height: u32) {
+        for c in &self.inners {
+            c.on_video_size(width, height);
+        }
+    }
+
     fn on_audio_format(&self, info: &AudioStreamInfo) {
         for c in &self.inners {
             c.on_audio_format(info);
@@ -52,6 +58,16 @@ impl AirPlayConsumer for TeePlayer {
         for c in &self.inners {
             c.on_audio_src_disconnect();
         }
+    }
+
+    fn on_volume(&self, volume_db: f64) {
+        for c in &self.inners {
+            c.on_volume(volume_db);
+        }
+    }
+
+    fn volume(&self) -> Option<f64> {
+        self.inners.iter().find_map(|consumer| consumer.volume())
     }
 
     fn on_media_playlist(&self, playlist_uri: &str) {

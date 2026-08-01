@@ -99,10 +99,8 @@ mod tests {
 
     #[test]
     fn writes_video_bytes_to_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "airplay-h264-dump-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("airplay-h264-dump-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dump.h264");

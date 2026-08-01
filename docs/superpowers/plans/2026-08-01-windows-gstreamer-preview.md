@@ -6,7 +6,7 @@
 
 **Architecture:** Keep AirPlay packet framing in `airplay-server`, move GPU-independent preview policy and Annex-B codec gating into focused `airplay-player` modules, and keep GStreamer construction behind its optional feature. The app parses user settings and passes typed options into the player; the direct pipeline performs no re-encoding, decoded-frame sampling, cropping, rotation, or fixed-resolution scaling.
 
-**Tech Stack:** Rust 2021, Tokio, serde/TOML, tracing, GStreamer 0.23 and gstreamer-app 0.23 behind optional Cargo features.
+**Tech Stack:** Rust 2021, Tokio, serde/TOML, tracing, GStreamer 1.20+ with Rust bindings 0.23 and gstreamer-app 0.23 behind optional Cargo features. The minimum runtime is required by appsrc `max-buffers` and `leaky-type`.
 
 ## Global Constraints
 
@@ -337,11 +337,11 @@ For every available decoder candidate and sink candidate in order:
 
 1. Generate the direct pipeline description.
 2. Parse and downcast it.
-3. Set it to `READY`.
+3. Request `READY`, wait up to three seconds for the actual state, and reject asynchronous bus errors.
 4. On failure, set `NULL`, log decoder/sink/reason, and continue.
 5. Store and log the first successful combination.
 
-Set explicit H.264 caps on appsrc, `format=time`, `is-live=true`, stream type `Stream`, `block=false`, and a bounded appsrc byte limit. Connect the queue `overrun` signal to increment and rate-limit a structured dropped-buffer warning.
+Set explicit H.264 caps on appsrc, `format=time`, `is-live=true`, stream type `Stream`, and `block=false`. Bound appsrc by both buffers and bytes with an explicit leaky policy: quality drops new input to preserve older queued access units, while balanced and low-latency drop old input to keep the newest data. Rate-limit both appsrc saturation and downstream queue-overrun warnings.
 
 - [ ] **Step 4: Integrate codec gate and structured bus logging**
 

@@ -15,7 +15,10 @@ Update checkboxes as items are verified on each environment.
 - [x] **Client unit tests** — control framing, encrypt round-trip (mDNS browse smoke ignored without network)
 - [x] **Default workspace build** — `cargo build --workspace` succeeds without GStreamer
 - [x] **Feature builds (no system GStreamer)** — `cargo build -p airplay-app --features "ffmpeg,vlc,h264-dump"` links
-- [ ] **Feature build gstreamer** — `cargo build -p airplay-app --features gstreamer` on a machine with GStreamer 1.x + pkg-config (not verified in docs-only environment without GStreamer installed)
+- [x] **Feature check gstreamer** — `cargo check -p airplay-app --features gstreamer` with GStreamer 1.28.5 + pkg-config on Windows
+- [x] **Windows GStreamer preview compile** — `cargo check -p airplay-app --features gstreamer` succeeds with GStreamer 1.28.5 on 2026-08-01
+- [x] **Windows preferred pipeline preflight** — ignored runtime test waits up to three seconds, verifies actual `READY`, and selects `d3d11h264dec` + `d3d11videosink` on the development machine (no visible window / sender)
+- [x] **Preview policy and H.264 framing tests** — preview modes, fallback ordering, strict AVCC conversion, Annex-B classification, SPS/PPS/IDR gating, and config compatibility are covered without requiring a GPU
 - [x] **All four player backends exist** — `h264_dump`, `gstreamer_player`, `ffmpeg_player`, `vlc_player` under `crates/airplay-player`
 - [x] **Client crate exists** — discovery, control, FairPlay video encryptor under `crates/airplay-client`
 - [x] **Runnable app exists** — `cargo run -p airplay-app` with TOML config / defaults
@@ -47,6 +50,7 @@ Re-run: `cargo test --workspace`
 
 - [ ] **Real-device mirror → h264-dump** — iOS/macOS Screen Mirroring appears as receiver; `dump.h264` non-empty / playable with `ffplay -f h264`
 - [ ] **Real-device mirror → GStreamer** — live window shows mirrored screen on primary OS
+- [ ] **Real-device direct D3D11 preview** — confirm sender geometry/aspect ratio, reconnect, resolution changes, balanced latency, and software fallback on Windows
 - [ ] **Real-device audio** — ALAC or AAC-ELD path audible without crashing process (best-effort)
 - [ ] **Client smoke** — `browse_airplay` finds local `airplay-app`; `ControlClient` GET `/info` + pair-setup/verify against it
 
@@ -54,9 +58,9 @@ Re-run: `cargo test --workspace`
 
 ## Cross-platform build / run notes verified
 
-- [ ] **Windows** — build notes (default + optional GStreamer env) verified on a clean machine
-- [ ] **Linux** — apt GStreamer packages + `cargo test --workspace` verified
-- [ ] **macOS** — Homebrew GStreamer + Local Network permission path verified
+- [ ] **Windows** (primary) — build notes (default + optional GStreamer env) verified on a clean machine
+- [ ] **Linux** (optional) — apt GStreamer packages + `cargo test --workspace` verified
+- ~~**macOS**~~ — **out of scope** (not a supported receiver build/run target)
 
 *(Automated tests on Windows during Task 15: default build + test OK; GStreamer feature not linked without system install.)*
 
@@ -65,13 +69,13 @@ Re-run: `cargo test --workspace`
 ## Docs / polish
 
 - [x] **README disclaimer** — educational / research; Apple trademark; as-is
-- [x] **README crate map + prerequisites per OS**
+- [x] **README crate map + prerequisites** (Windows primary, Linux optional)
 - [x] **README build/run + feature flags + config example**
 - [x] **README device mirror steps** (h264-dump then GStreamer)
 - [x] **README client usage sketch + known limitations**
 - [x] **overflow-checks=false documented** as HandGarble/OmgHax Java-parity technical debt
 - [x] **Links to design/plan under docs/superpowers/**
-- [x] **Firewall / mDNS notes** (Win/Linux/macOS)
+- [x] **Firewall / mDNS notes** (Windows + optional Linux; macOS receiver not supported)
 
 ---
 
@@ -83,14 +87,15 @@ Re-run: `cargo test --workspace`
 | GStreamer default vs app default | Spec preferred GStreamer as “default player”; app still defaults to `h264-dump` so zero-dep builds work — set `implementation = "gstreamer"` when installed |
 | VLC stability | Best-effort only |
 | Full sender client | Library primitives only; no polished mirror-sender binary |
+| macOS receiver | Explicitly **not supported** — no install docs or acceptance |
 
 ---
 
 ## Definition of done (from design §7.3)
 
 1. [x] Ported vector/unit tests green under `cargo test`
-2. [ ] Real-device mirror works with GStreamer on at least one of Win/Linux/macOS
-3. [ ] Remaining OSes: project builds; run instructions documented; smoke as feasible  
-     *(instructions documented; multi-OS smoke pending)*
+2. [ ] Real-device mirror works with GStreamer on **Windows**
+3. [ ] Linux (optional): project builds; run instructions documented; smoke as feasible
+     *(instructions documented; Linux smoke pending; macOS out of scope)*
 4. [x] All four player backends exist; h264-dump verified in tests; FFmpeg/VLC compile with features
 5. [x] Client crate present with discovery/control path and documented limits

@@ -4,6 +4,8 @@
 **Status:** Approved for implementation planning  
 **Scope:** High-quality, low-latency Windows preview through the optional GStreamer player backend
 
+**Prerequisite:** GStreamer 1.20+; bounded nonblocking appsrc ingress uses the `max-buffers` and `leaky-type` properties introduced in 1.20.
+
 ## 1. Goal
 
 Provide a deterministic Windows-preferred GStreamer video path that preserves the sender's H.264 resolution and aspect ratio, avoids re-encoding, prefers D3D11 hardware decode/rendering, and falls back cleanly when preferred runtime elements cannot be used.
@@ -31,6 +33,9 @@ appsrc name=video_src
     format=time
     do-timestamp=true
     block=false
+    max-buffers=<mode bound>
+    max-bytes=4194304
+    leaky-type=<upstream for quality, downstream otherwise>
     caps="video/x-h264,stream-format=byte-stream,alignment=au"
 ! queue name=video_queue
     max-size-buffers=<mode>
@@ -59,7 +64,7 @@ Windows sink candidates are ordered:
 
 Non-Windows builds use `autovideosink`; GStreamer remains optional on every platform.
 
-Selection first checks `gst::ElementFactory` availability. Candidate decoder/sink combinations are then built in deterministic order and moved to `READY`. The first combination that succeeds is retained; failed candidates are returned to `NULL` and logged before the next candidate is tried. This handles an installed D3D11 factory that cannot initialize on the active machine more cleanly than a name-only check.
+Selection first checks `gst::ElementFactory` availability. Candidate decoder/sink combinations are then built in deterministic order, given three seconds to complete the transition to actual `READY`, and checked for asynchronous bus errors. The first combination that succeeds is retained; failed candidates are returned to `NULL` and logged before the next candidate is tried. This handles an installed D3D11 factory that cannot initialize on the active machine more cleanly than a name-only check.
 
 The selected decoder, whether it is hardware accelerated, the selected sink, input caps, and fallback reasons are logged with `tracing`.
 

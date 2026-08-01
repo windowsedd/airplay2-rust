@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Port `java-airplay-2open` to a Rust Cargo workspace with full module parity (lib, server, all players, client), GStreamer as default player, Windows/Linux/macOS support, Java vector tests + real-device mirror acceptance.
+**Goal:** Port `java-airplay-2open` to a Rust Cargo workspace with full module parity (lib, server, all players, client), GStreamer as default player, Windows primary (+ optional Linux; no macOS receiver), Java vector tests + real-device mirror acceptance.
 
 **Architecture:** Multi-crate workspace mirroring Java modules. `airplay-lib` owns pairing/FairPlay/RTSP setup/decrypt/Bonjour helpers (no TCP servers). `airplay-server` owns RTSP/HTTP control, media sockets, sessions, and the `AirPlayConsumer` trait. Players implement that trait behind Cargo features. `airplay-app` wires config → player → server. `airplay-client` is the sender path.
 
@@ -13,7 +13,7 @@
 
 ## Global Constraints
 
-- Platforms: Windows + Linux + macOS (build everywhere; first real-device mirror on the developer's primary OS).
+- Platforms: **Windows primary**, Linux optional; **macOS is not a supported receiver build/run target** (iOS/macOS senders only). First real-device mirror on Windows.
 - Default player: GStreamer (`player.implementation = gstreamer`).
 - Acceptance: ported Java unit/vector tests green **and** real-device screen mirror with GStreamer.
 - Pure Rust crypto for pairing/FairPlay path (no OpenSSL required for core).
@@ -872,7 +872,7 @@ git commit -m "feat: h264-dump player and runnable airplay-app"
 - [ ] **Step 1: Feature-gated dependency**
 - [ ] **Step 2: Video pipeline to window**
 - [ ] **Step 3: Audio pipeline**
-- [ ] **Step 4: README install notes for Win/Linux/macOS GStreamer**
+- [ ] **Step 4: README install notes for Windows (+ optional Linux) GStreamer**
 - [ ] **Step 5: Real-device acceptance on primary OS**
 - [ ] **Step 6: Commit**
 
@@ -959,7 +959,7 @@ git commit -m "docs: cross-platform run guide and acceptance notes"
 | GStreamer default | 12 |
 | FFmpeg + VLC | 13 |
 | Client | 14 |
-| Win/Linux/macOS docs + acceptance | 15 |
+| Win (+ optional Linux) docs + acceptance | 15 |
 | Java vector tests | 3–6 |
 | Real-device mirror | 11–12 manual |
 

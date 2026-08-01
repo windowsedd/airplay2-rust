@@ -29,6 +29,10 @@ struct AppConfig {
 struct AirplaySection {
     #[serde(default = "default_server_name")]
     server_name: String,
+    /// Optional quality preset: `low` | `medium` | `high` | `ultra` | `custom`.
+    /// Presets set width/height/fps (no fake bitrate — phone encodes for this size).
+    #[serde(default = "default_quality")]
+    quality: String,
     #[serde(default = "default_width")]
     width: u32,
     #[serde(default = "default_height")]
@@ -45,6 +49,7 @@ impl Default for AirplaySection {
     fn default() -> Self {
         Self {
             server_name: default_server_name(),
+            quality: default_quality(),
             width: default_width(),
             height: default_height(),
             fps: default_fps(),
@@ -59,6 +64,22 @@ struct PlayerSection {
     implementation: String,
     #[serde(default = "default_output")]
     output: String,
+    /// Rendering queue/clock policy: quality | balanced | low-latency.
+    #[serde(default = "default_preview_mode")]
+    preview_mode: String,
+    /// Prefer the Windows D3D11 H.264 decoder when it is usable.
+    #[serde(default = "default_hardware_decode")]
+    hardware_decode: bool,
+    /// Orientation: `auto` (default, follow stream) | `none` | `cw` | `ccw`.
+    /// Auto = portrait home UI upright; landscape when game/app stream is wide.
+    #[serde(default = "default_rotate")]
+    rotate: String,
+    /// Master switch; if false, forces rotate = none.
+    #[serde(default = "default_auto_rotate")]
+    auto_rotate: bool,
+    /// Detect landscape game vs home UI (stream size + letterbox crop).
+    #[serde(default = "default_detect_game")]
+    detect_game: bool,
 }
 
 impl Default for PlayerSection {
@@ -66,6 +87,11 @@ impl Default for PlayerSection {
         Self {
             implementation: default_implementation(),
             output: default_output(),
+            preview_mode: default_preview_mode(),
+            hardware_decode: default_hardware_decode(),
+            rotate: default_rotate(),
+            auto_rotate: default_auto_rotate(),
+            detect_game: default_detect_game(),
         }
     }
 }
@@ -73,17 +99,43 @@ impl Default for PlayerSection {
 fn default_server_name() -> String {
     "airplay2-rust".into()
 }
+fn default_quality() -> String {
+    // High-quality preview by default (real encode size, not simulated).
+    "high".into()
+}
 fn default_width() -> u32 {
-    1920
+    // Portrait-first FHD+ (used when quality = custom or as preset fallback).
+    1170
 }
 fn default_height() -> u32 {
-    1080
+    2532
 }
 fn default_fps() -> u32 {
     60
 }
 fn default_refresh_rate() -> u32 {
     60
+}
+
+/// Resolve advertised (width, height, fps) from quality preset and/or explicit sizes.
+///
+/// There is **no bitrate simulation**: larger size → phone typically uses more bits.
+/// Presets are portrait-first (home UI); the phone may reconfigure for landscape games.
+fn resolve_display_quality(airplay: &AirplaySection) -> (u32, u32, u32, &'static str) {
+    let q = airplay.quality.trim().to_ascii_lowercase();
+    match q.as_str() {
+        "low" | "lq" | "smooth" => (720, 1280, 30, "low"),
+        "medium" | "med" | "mid" => (1080, 1920, 60, "medium"),
+        "high" | "hq" | "" => (1170, 2532, 60, "high"),
+        "ultra" | "max" | "4k" => (1290, 2796, 60, "ultra"),
+        // custom / unknown: use explicit width/height/fps from config
+        _ => (
+            airplay.width.max(1),
+            airplay.height.max(1),
+            airplay.fps.clamp(1, 120),
+            "custom",
+        ),
+    }
 }
 fn default_implementation() -> String {
     // "auto" = dump.h264 + ffplay window + GStreamer window (whatever is built in).
@@ -102,6 +154,43 @@ fn resolve_implementation(configured: &str) -> String {
 fn default_output() -> String {
     "dump.h264".into()
 }
+fn default_preview_mode() -> String {
+    "balanced".into()
+}
+fn default_hardware_decode() -> bool {
+    true
+}
+fn default_rotate() -> String {
+    "auto".into()
+}
+fn default_auto_rotate() -> bool {
+    true
+}
+fn default_detect_game() -> bool {
+    true
+}
+
+/// Resolve effective rotate mode string from config.
+fn effective_rotate(player: &PlayerSection) -> String {
+    if !player.auto_rotate {
+        return "none".into();
+    }
+    let r = player.rotate.trim().to_ascii_lowercase();
+    if r.is_empty() {
+        "auto".into()
+    } else {
+        r
+    }
+}
+
+fn parse_preview_settings(player: &PlayerSection) -> Result<(airplay_player::PreviewMode, bool)> {
+    let mode = player
+        .preview_mode
+        .parse::<airplay_player::PreviewMode>()
+        .map_err(anyhow::Error::msg)
+        .context("player.preview_mode")?;
+    Ok((mode, player.hardware_decode))
+}
 
 fn default_config() -> AppConfig {
     AppConfig {
@@ -109,6 +198,11 @@ fn default_config() -> AppConfig {
         player: PlayerSection {
             implementation: "auto".into(),
             output: "dump.h264".into(),
+            preview_mode: default_preview_mode(),
+            hardware_decode: default_hardware_decode(),
+            rotate: default_rotate(),
+            auto_rotate: default_auto_rotate(),
+            detect_game: default_detect_game(),
         },
     }
 }
@@ -162,14 +256,18 @@ fn load_config(path: Option<&Path>) -> Result<(AppConfig, PathBuf)> {
     let starter = concat!(
         "[airplay]\n",
         "server_name = \"airplay2-rust\"\n",
-        "width = 1920\n",
-        "height = 1080\n",
-        "fps = 60\n",
+        "# Quality: low | medium | high | ultra | custom (no fake bitrate — phone encodes to size)\n",
+        "quality = \"high\"\n",
         "refresh_rate = 60\n",
         "\n",
         "[player]\n",
         "implementation = \"auto\"\n",
         "output = \"dump.h264\"\n",
+        "preview_mode = \"balanced\"\n",
+        "hardware_decode = true\n",
+        "auto_rotate = true\n",
+        "rotate = \"auto\"\n",
+        "detect_game = true\n",
     );
     let mut used = PathBuf::from("config.toml");
     for path in [
@@ -244,12 +342,22 @@ fn missing_feature_msg(name: &str, feature: &str) -> String {
     )
 }
 
-fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
+fn build_auto_consumer(
+    output: &str,
+    rotate: &str,
+    detect_game: bool,
+    preview_mode: airplay_player::PreviewMode,
+    hardware_decode: bool,
+) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
     use airplay_server::AirPlayConsumer;
 
     let mut parts: Vec<Box<dyn AirPlayConsumer>> = Vec::new();
     let mut labels: Vec<&'static str> = Vec::new();
+    #[allow(unused_mut)]
     let mut have_live_window = false;
+
+    #[cfg(not(feature = "gstreamer"))]
+    let _ = (preview_mode, hardware_decode);
 
     // 1) Always dump for debugging (file only — no extra window).
     #[cfg(feature = "h264-dump")]
@@ -263,13 +371,15 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
     // 2) One live window only: prefer GStreamer (video + ALAC/AAC-ELD).
     #[cfg(feature = "gstreamer")]
     {
-        match airplay_player::GStreamerPlayer::new() {
+        match airplay_player::GStreamerPlayer::with_preview(1.0, preview_mode, hardware_decode) {
             Ok(p) => {
                 parts.push(Box::new(p));
                 labels.push("gstreamer");
                 have_live_window = true;
                 tracing::info!(
-                    "GStreamer live window ready (video + ALAC/AAC-ELD) — title airplay2-rust"
+                    preview_mode = %preview_mode,
+                    hardware_decode,
+                    "GStreamer direct live window ready"
                 );
             }
             Err(e) => {
@@ -291,7 +401,8 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
     if !have_live_window {
         #[cfg(feature = "ffmpeg")]
         {
-            match airplay_player::FFmpegPlayer::new() {
+            let mode = airplay_player::FfmpegRotateMode::parse(rotate);
+            match airplay_player::FFmpegPlayer::with_rotate(mode) {
                 Ok(p) => {
                     p.set_dump_path(output);
                     parts.push(Box::new(p));
@@ -299,7 +410,8 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
                     have_live_window = true;
                     tracing::info!(
                         dump = %output,
-                        "ffplay fallback window ready (title: airplay2-rust)"
+                        ?mode,
+                        "ffplay fallback window ready (auto portrait rotate)"
                     );
                 }
                 Err(e) => {
@@ -329,6 +441,8 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
     tracing::info!(
         backends = %labels.join(" + "),
         live = have_live_window,
+        rotate = %rotate,
+        detect_game,
         "player: auto (one live window + optional dump)"
     );
     Ok(Arc::new(airplay_player::TeePlayer::new(parts)))
@@ -337,10 +451,16 @@ fn build_auto_consumer(output: &str) -> Result<Arc<dyn airplay_server::AirPlayCo
 fn build_consumer(
     implementation: &str,
     output: &str,
+    rotate: &str,
+    detect_game: bool,
+    preview_mode: airplay_player::PreviewMode,
+    hardware_decode: bool,
 ) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
     let impl_key = implementation.to_ascii_lowercase();
     match impl_key.as_str() {
-        "auto" | "default" | "mirror" => build_auto_consumer(output),
+        "auto" | "default" | "mirror" => {
+            build_auto_consumer(output, rotate, detect_game, preview_mode, hardware_decode)
+        }
         "h264-dump" | "h264_dump" | "dump" => {
             #[cfg(feature = "h264-dump")]
             {
@@ -357,9 +477,17 @@ fn build_consumer(
         "gstreamer" | "gst" => {
             #[cfg(feature = "gstreamer")]
             {
-                let player = airplay_player::GStreamerPlayer::new()
-                    .map_err(|e| anyhow::anyhow!("GStreamer player: {e}"))?;
-                tracing::info!("player: gstreamer");
+                let player = airplay_player::GStreamerPlayer::with_preview(
+                    1.0,
+                    preview_mode,
+                    hardware_decode,
+                )
+                .map_err(|e| anyhow::anyhow!("GStreamer player: {e}"))?;
+                tracing::info!(
+                    preview_mode = %preview_mode,
+                    hardware_decode,
+                    "player: gstreamer direct preview"
+                );
                 Ok(Arc::new(player))
             }
             #[cfg(not(feature = "gstreamer"))]
@@ -370,9 +498,10 @@ fn build_consumer(
         "ffmpeg" | "ffplay" => {
             #[cfg(feature = "ffmpeg")]
             {
-                let player = airplay_player::FFmpegPlayer::new()
+                let mode = airplay_player::FfmpegRotateMode::parse(rotate);
+                let player = airplay_player::FFmpegPlayer::with_rotate(mode)
                     .map_err(|e| anyhow::anyhow!("FFmpeg player: {e}"))?;
-                tracing::info!("player: ffmpeg (ffplay)");
+                tracing::info!(?mode, "player: ffmpeg (ffplay, auto portrait rotate)");
                 Ok(Arc::new(player))
             }
             #[cfg(not(feature = "ffmpeg"))]
@@ -413,32 +542,56 @@ async fn main() -> Result<()> {
     let config_path_arg = parse_args();
     let (cfg, config_path) = load_config(config_path_arg.as_deref())?;
 
-    let fps = cfg.airplay.fps.clamp(1, 120);
+    let (width, height, fps_raw, quality_label) = resolve_display_quality(&cfg.airplay);
+    let fps = fps_raw.clamp(1, 120);
     let refresh_rate = cfg.airplay.refresh_rate.clamp(1, 240);
-    if cfg.airplay.fps != fps {
-        tracing::warn!(requested = cfg.airplay.fps, using = fps, "fps clamped to 1..=120");
+    if fps_raw != fps {
+        tracing::warn!(requested = fps_raw, using = fps, "fps clamped to 1..=120");
     }
 
     let server_cfg = AirPlayConfig {
         server_name: cfg.airplay.server_name.clone(),
-        width: cfg.airplay.width,
-        height: cfg.airplay.height,
+        width,
+        height,
         fps,
         refresh_rate,
     };
 
     tracing::info!(
         name = %server_cfg.server_name,
+        quality = quality_label,
         width = server_cfg.width,
         height = server_cfg.height,
         max_fps = server_cfg.fps,
         refresh_rate = server_cfg.refresh_rate,
-        "advertising display to iPhone (resolution drives quality; bitrate is chosen by the phone)"
+        "preview quality: advertising display size to iPhone (no simulated bitrate — phone encodes H.264 for this size)"
     );
 
     let implementation = resolve_implementation(&cfg.player.implementation);
+    let (preview_mode, hardware_decode) = parse_preview_settings(&cfg.player)?;
+    let rotate = effective_rotate(&cfg.player);
+    let detect_game = cfg.player.detect_game;
     let dump_path = PathBuf::from(&cfg.player.output);
-    let consumer = build_consumer(&implementation, &cfg.player.output).with_context(|| {
+    tracing::info!(
+        rotate = %rotate,
+        auto_rotate = cfg.player.auto_rotate,
+        detect_game,
+        "legacy orientation settings; direct GStreamer preview preserves encoded frames"
+    );
+    tracing::info!(
+        preview_mode = %preview_mode,
+        hardware_decode,
+        "video preview settings"
+    );
+    let consumer = build_consumer(
+        &implementation,
+        &cfg.player.output,
+        &rotate,
+        detect_game,
+        preview_mode,
+        hardware_decode,
+    )
+    .with_context(|| {
         format!(
             "failed to start player '{implementation}'. \
              For a live window you need GStreamer 1.x on PATH (see README). \
@@ -504,4 +657,39 @@ async fn main() -> Result<()> {
 
     server.stop().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_player_config_gets_safe_preview_defaults() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+            [player]
+            implementation = "gstreamer"
+            output = "dump.h264"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.player.preview_mode, "balanced");
+        assert!(cfg.player.hardware_decode);
+    }
+
+    #[test]
+    fn all_preview_modes_parse_and_invalid_mode_fails() {
+        for mode in ["quality", "balanced", "low-latency"] {
+            let player = PlayerSection {
+                preview_mode: mode.into(),
+                ..PlayerSection::default()
+            };
+            assert!(parse_preview_settings(&player).is_ok());
+        }
+        let player = PlayerSection {
+            preview_mode: "turbo".into(),
+            ..PlayerSection::default()
+        };
+        assert!(parse_preview_settings(&player).is_err());
+    }
 }

@@ -22,11 +22,11 @@ pub struct AirPlayConfig {
 
 impl Default for AirPlayConfig {
     fn default() -> Self {
-        // Higher defaults → phone often picks higher encode bitrate/resolution.
+        // High-quality portrait advertise (≈ phone FHD+); app presets may override.
         Self {
             server_name: "airplay2-rust".into(),
-            width: 1920,
-            height: 1080,
+            width: 1170,
+            height: 2532,
             fps: 60,
             refresh_rate: 60,
         }
@@ -41,9 +41,13 @@ mod tests {
     fn default_config_values() {
         let cfg = AirPlayConfig::default();
         assert_eq!(cfg.server_name, "airplay2-rust");
-        assert_eq!(cfg.width, 1920);
-        assert_eq!(cfg.height, 1080);
+        assert_eq!(cfg.width, 1170);
+        assert_eq!(cfg.height, 2532);
         assert_eq!(cfg.fps, 60);
         assert_eq!(cfg.refresh_rate, 60);
+        assert!(
+            cfg.height > cfg.width,
+            "default advertise is portrait (home UI)"
+        );
     }
 }

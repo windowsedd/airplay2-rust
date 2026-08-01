@@ -21,6 +21,8 @@
 #[cfg(feature = "h264-dump")]
 mod h264_dump;
 
+mod h264;
+
 #[cfg(feature = "gstreamer")]
 mod gstreamer_player;
 
@@ -30,16 +32,28 @@ mod ffmpeg_player;
 #[cfg(feature = "vlc")]
 mod vlc_player;
 
+mod orientation;
+mod preview;
 mod tee;
+
+pub use h264::{classify_annex_b, CodecGate, GateResult, H264InputError, NalKinds};
+pub use orientation::{
+    detect_letterbox_game, mode_from_stream_size, ContentMode, LetterboxCrop, LetterboxDetect,
+    ModeTracker,
+};
+pub use preview::{
+    decoder_candidates, select_decoder, select_sink, sink_candidates, DecoderChoice, PreviewMode,
+    PreviewOptions, SinkChoice,
+};
 
 #[cfg(feature = "h264-dump")]
 pub use h264_dump::H264Dump;
 
 #[cfg(feature = "gstreamer")]
-pub use gstreamer_player::GStreamerPlayer;
+pub use gstreamer_player::{GStreamerPlayer, RotateMode};
 
 #[cfg(feature = "ffmpeg")]
-pub use ffmpeg_player::FFmpegPlayer;
+pub use ffmpeg_player::{FFmpegPlayer, FfmpegRotateMode};
 
 #[cfg(feature = "vlc")]
 pub use vlc_player::VlcPlayer;

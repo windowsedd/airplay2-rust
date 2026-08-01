@@ -1,14 +1,18 @@
 //! GStreamer live player for AirPlay screen-mirror video (and optional audio).
 //!
-//! - Video window title: **airplay2-rust** (renames Windows D3D12 default title)
+//! - Windows prefers D3D11 H.264 decode and D3D11 rendering, with runtime fallback.
+//! - Video window title: **airplay2-rust**.
 //! - PC-side volume (not phone): GStreamer `volume` element + console keys:
 //!   `+` / `=` louder, `-` quieter, `m` mute/unmute, `0`–`9` set level
 //!
 //! Pipeline (H.264 annex-B):
-//! `appsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink`
+//! `appsrc ! queue ! h264parse ! selected-decoder ! selected-video-sink`
+//!
+//! The direct path performs no re-encoding, fixed scaling, decoded-frame crop,
+//! rotation, or CPU frame extraction.
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -20,12 +24,293 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+use crate::{
+    decoder_candidates, sink_candidates, CodecGate, DecoderChoice, GateResult, PreviewMode,
+    PreviewOptions, SinkChoice,
+};
+
 const WINDOW_TITLE: &str = "airplay2-rust";
+
+fn video_pipeline_description(
+    decoder: DecoderChoice,
+    sink: SinkChoice,
+    options: PreviewOptions,
+) -> String {
+    let leaky = if options.queue_leaky {
+        "downstream"
+    } else {
+        "no"
+    };
+    // Keep media-socket ingestion non-blocking but bounded. Quality mode keeps
+    // older queued access units; latency-oriented modes keep the newest ones.
+    let appsrc_leaky = if options.queue_leaky {
+        "downstream"
+    } else {
+        "upstream"
+    };
+    let sink_properties = match sink {
+        SinkChoice::D3d11VideoSink => format!("force-aspect-ratio=true sync={}", options.sink_sync),
+        SinkChoice::AutoVideoSink => format!("sync={}", options.sink_sync),
+    };
+    format!(
+        "appsrc name=h264-src is-live=true format=time do-timestamp=true block=false \
+           max-buffers={} max-bytes=4194304 leaky-type={} \
+         caps=video/x-h264,stream-format=byte-stream,alignment=au \
+         ! queue name=video-queue max-size-buffers={} max-size-bytes=0 \
+           max-size-time=0 leaky={} \
+         ! h264parse config-interval=-1 \
+         ! {} \
+         ! {} name=videosink {}",
+        options.queue_max_buffers,
+        appsrc_leaky,
+        options.queue_max_buffers,
+        leaky,
+        decoder.factory_name(),
+        sink.factory_name(),
+        sink_properties,
+    )
+}
+
+fn preflight_to_ready(pipeline: &gst::Pipeline) -> Result<(), String> {
+    pipeline
+        .set_state(gst::State::Ready)
+        .map_err(|error| format!("request READY: {error}"))?;
+
+    let (transition, current, pending) = pipeline.state(gst::ClockTime::from_seconds(3));
+    if let Some(message) = pipeline
+        .bus()
+        .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
+    {
+        if let gst::MessageView::Error(error) = message.view() {
+            return Err(format!(
+                "asynchronous READY error from {}: {} ({:?})",
+                message
+                    .src()
+                    .map(|source| source.path_string().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                error.error(),
+                error.debug()
+            ));
+        }
+    }
+    transition.map_err(|error| {
+        format!("READY transition failed: {error} (current={current:?}, pending={pending:?})")
+    })?;
+    if current != gst::State::Ready {
+        return Err(format!(
+            "READY transition timed out (current={current:?}, pending={pending:?})"
+        ));
+    }
+    Ok(())
+}
+
+fn build_video_pipeline(
+    preview_mode: PreviewMode,
+    hardware_decode: bool,
+) -> Result<
+    (
+        gst::Pipeline,
+        gst_app::AppSrc,
+        DecoderChoice,
+        SinkChoice,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ),
+    String,
+> {
+    let options = preview_mode.options();
+    let mut failures = Vec::new();
+
+    for decoder in decoder_candidates(hardware_decode) {
+        let decoder_name = decoder.factory_name();
+        if gst::ElementFactory::find(decoder_name).is_none() {
+            tracing::warn!(
+                decoder = decoder_name,
+                "GStreamer decoder unavailable; trying fallback"
+            );
+            continue;
+        }
+
+        for sink in sink_candidates(cfg!(windows)) {
+            let sink_name = sink.factory_name();
+            if gst::ElementFactory::find(sink_name).is_none() {
+                tracing::warn!(
+                    sink = sink_name,
+                    "GStreamer video sink unavailable; trying fallback"
+                );
+                continue;
+            }
+
+            let description = video_pipeline_description(decoder, sink, options);
+            let pipeline = match gst::parse::launch(&description)
+                .map_err(|error| error.to_string())
+                .and_then(|element| {
+                    element
+                        .downcast::<gst::Pipeline>()
+                        .map_err(|_| "launch result is not a Pipeline".to_string())
+                }) {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    tracing::warn!(
+                        decoder = decoder_name,
+                        sink = sink_name,
+                        %error,
+                        "GStreamer video pipeline construction failed"
+                    );
+                    failures.push(format!("{decoder_name}+{sink_name}: {error}"));
+                    continue;
+                }
+            };
+            install_aspect_ratio_handler(&pipeline);
+
+            if let Err(error) = preflight_to_ready(&pipeline) {
+                let _ = pipeline.set_state(gst::State::Null);
+                tracing::warn!(
+                    decoder = decoder_name,
+                    sink = sink_name,
+                    %error,
+                    "GStreamer video pipeline preflight failed"
+                );
+                failures.push(format!("{decoder_name}+{sink_name}: {error}"));
+                continue;
+            }
+            apply_force_aspect_ratio(&pipeline);
+
+            let Some(src) = pipeline.by_name("h264-src") else {
+                let _ = pipeline.set_state(gst::State::Null);
+                failures.push(format!("{decoder_name}+{sink_name}: missing h264-src"));
+                continue;
+            };
+            let h264_src = match src.downcast::<gst_app::AppSrc>() {
+                Ok(src) => src,
+                Err(_) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    failures.push(format!(
+                        "{decoder_name}+{sink_name}: h264-src is not appsrc"
+                    ));
+                    continue;
+                }
+            };
+
+            let caps = gst::Caps::from_str(
+                "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au",
+            )
+            .map_err(|error| format!("H.264 caps: {error}"))?;
+            h264_src.set_caps(Some(&caps));
+            h264_src.set_format(gst::Format::Time);
+            h264_src.set_is_live(true);
+            h264_src.set_stream_type(gst_app::AppStreamType::Stream);
+            h264_src.set_property("block", false);
+            h264_src.set_max_bytes(4 * 1024 * 1024);
+
+            let appsrc_saturation_events = Arc::new(AtomicU64::new(0));
+            let saturation_events = Arc::clone(&appsrc_saturation_events);
+            h264_src.connect("enough-data", false, move |_| {
+                let count = saturation_events.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 5 || count % 120 == 0 {
+                    tracing::warn!(
+                        count,
+                        "GStreamer appsrc is full; configured leaky policy is dropping access units"
+                    );
+                }
+                None
+            });
+
+            let queue_overruns = Arc::new(AtomicU64::new(0));
+            if let Some(queue) = pipeline.by_name("video-queue") {
+                let overruns = Arc::clone(&queue_overruns);
+                let leaky = options.queue_leaky;
+                queue.connect("overrun", false, move |_| {
+                    let overruns = overruns.fetch_add(1, Ordering::Relaxed) + 1;
+                    if overruns <= 5 || overruns % 120 == 0 {
+                        if leaky {
+                            tracing::warn!(
+                                overruns,
+                                "GStreamer video queue overrun; downstream-leaky mode drops old buffers"
+                            );
+                        } else {
+                            tracing::warn!(
+                                overruns,
+                                "GStreamer quality-mode video queue is full"
+                            );
+                        }
+                    }
+                    None
+                });
+            }
+
+            tracing::info!(
+                decoder = decoder_name,
+                hardware = decoder.is_hardware(),
+                sink = sink_name,
+                preview_mode = %preview_mode,
+                queue_max_buffers = options.queue_max_buffers,
+                queue_leaky = options.queue_leaky,
+                sink_sync = options.sink_sync,
+                caps = %caps,
+                "selected GStreamer video pipeline"
+            );
+            return Ok((
+                pipeline,
+                h264_src,
+                decoder,
+                sink,
+                queue_overruns,
+                appsrc_saturation_events,
+            ));
+        }
+    }
+
+    Err(format!(
+        "no usable GStreamer H.264 decoder/video sink combination ({})",
+        failures.join("; ")
+    ))
+}
+
+/// How to apply `videoflip` for stream orientation.
+///
+/// **Default / Auto:** follow the phone stream with **no** forced flip:
+/// - **Portrait** (height > width) — home screen / apps (default)
+/// - **Landscape** (width ≥ height) — games & landscape apps
+///
+/// Use `Cw` / `Ccw` only if a specific device still paints sideways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RotateMode {
+    /// Follow stream: no videoflip; portrait UI vs landscape game via dimensions.
+    #[default]
+    Auto,
+    None,
+    /// Force 90° clockwise.
+    Cw,
+    /// Force 90° counter-clockwise.
+    Ccw,
+}
+
+impl RotateMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "0" => Self::None,
+            "cw" | "clockwise" | "right" | "90" => Self::Cw,
+            "ccw" | "counterclockwise" | "counter-clockwise" | "left" | "270" => Self::Ccw,
+            _ => Self::Auto, // "auto" | "true" | "1" | "portrait" | unknown
+        }
+    }
+}
 
 /// Live GStreamer-backed consumer: titled video window + PC volume control.
 pub struct GStreamerPlayer {
     h264_pipeline: Mutex<gst::Pipeline>,
     h264_src: Mutex<gst_app::AppSrc>,
+    codec_gate: Mutex<CodecGate>,
+    selected_decoder: DecoderChoice,
+    selected_sink: SinkChoice,
+    preview_mode: PreviewMode,
+    hardware_decode: bool,
+    queue_overruns: Arc<AtomicU64>,
+    appsrc_saturation_events: Arc<AtomicU64>,
+    waiting_config_drops: AtomicU64,
+    waiting_idr_drops: AtomicU64,
+    frames_pushed: AtomicU64,
     alac_pipeline: Mutex<gst::Pipeline>,
     alac_src: Mutex<gst_app::AppSrc>,
     aac_eld_pipeline: Mutex<gst::Pipeline>,
@@ -34,8 +319,11 @@ pub struct GStreamerPlayer {
     hls_pipeline: Mutex<Option<gst::Pipeline>>,
     /// Shared linear volume (0.0–2.0), stored as milli-units (1000 = 1.0).
     volume_milli: Arc<AtomicU32>,
+    /// Last volume requested by the AirPlay sender, in milli-decibels.
+    airplay_volume_db_milli: AtomicI32,
     muted: Arc<AtomicBool>,
     volume_before_mute: Mutex<f64>,
+    last_size: Mutex<(u32, u32)>,
     _main_loop_thread: Option<JoinHandle<()>>,
     _volume_keys_thread: Option<JoinHandle<()>>,
     main_loop_quit: Arc<AtomicBool>,
@@ -44,11 +332,51 @@ pub struct GStreamerPlayer {
 impl GStreamerPlayer {
     /// Initialize GStreamer, pipelines, window title fixer, and volume key thread.
     pub fn new() -> Result<Self, String> {
-        Self::with_volume(1.0)
+        Self::with_preview(1.0, PreviewMode::Balanced, true)
     }
 
     /// Create with initial PC volume in `0.0..=2.0` (1.0 = unity).
     pub fn with_volume(initial: f64) -> Result<Self, String> {
+        Self::with_preview(initial, PreviewMode::Balanced, true)
+    }
+
+    /// Compatibility constructor. Direct GStreamer preview intentionally
+    /// bypasses decoded-frame rotation and crop processing.
+    pub fn with_options(
+        initial: f64,
+        rotate_mode: RotateMode,
+        detect_game: bool,
+    ) -> Result<Self, String> {
+        Self::with_all_options(
+            initial,
+            PreviewMode::Balanced,
+            true,
+            rotate_mode,
+            detect_game,
+        )
+    }
+
+    pub fn with_preview(
+        initial: f64,
+        preview_mode: PreviewMode,
+        hardware_decode: bool,
+    ) -> Result<Self, String> {
+        Self::with_all_options(
+            initial,
+            preview_mode,
+            hardware_decode,
+            RotateMode::Auto,
+            false,
+        )
+    }
+
+    fn with_all_options(
+        initial: f64,
+        preview_mode: PreviewMode,
+        hardware_decode: bool,
+        rotate_mode: RotateMode,
+        detect_game: bool,
+    ) -> Result<Self, String> {
         gst::init().map_err(|e| format!("gstreamer init failed: {e}"))?;
 
         let volume_milli = Arc::new(AtomicU32::new(volume_to_milli(initial.clamp(0.0, 2.0))));
@@ -72,36 +400,23 @@ impl GStreamerPlayer {
             })
             .map_err(|e| format!("spawn gstreamer main loop: {e}"))?;
 
-        let h264_pipeline = gst::parse::launch(
-            "appsrc name=h264-src is-live=true format=time do-timestamp=true \
-             ! h264parse config-interval=-1 \
-             ! avdec_h264 \
-             ! videoconvert \
-             ! autovideosink name=videosink sync=false",
-        )
-        .map_err(|e| format!("parse H.264 pipeline: {e}"))?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| "H.264 launch result is not a Pipeline".to_string())?;
+        let (
+            h264_pipeline,
+            h264_src,
+            selected_decoder,
+            selected_sink,
+            queue_overruns,
+            appsrc_saturation_events,
+        ) = build_video_pipeline(preview_mode, hardware_decode)?;
 
         apply_window_title(&h264_pipeline, WINDOW_TITLE);
-
-        let h264_src = h264_pipeline
-            .by_name("h264-src")
-            .ok_or_else(|| "missing appsrc h264-src".to_string())?
-            .downcast::<gst_app::AppSrc>()
-            .map_err(|_| "h264-src is not an AppSrc".to_string())?;
-
-        h264_src.set_caps(Some(
-            &gst::Caps::from_str(
-                "video/x-h264,colorimetry=bt709,stream-format=(string)byte-stream,alignment=(string)au",
-            )
-            .map_err(|e| format!("H.264 caps: {e}"))?,
-        ));
-        h264_src.set_format(gst::Format::Time);
-        h264_src.set_is_live(true);
-        h264_src.set_stream_type(gst_app::AppStreamType::Stream);
-        h264_src.set_property("block", true);
-        h264_src.set_max_bytes(4 * 1024 * 1024);
+        if rotate_mode != RotateMode::Auto || detect_game {
+            tracing::info!(
+                ?rotate_mode,
+                detect_game,
+                "direct GStreamer preview bypasses decoded-frame rotation and crop processing"
+            );
+        }
 
         // volume element = PC-side gain (does not change phone volume).
         let alac_pipeline = gst::parse::launch(
@@ -167,22 +482,41 @@ impl GStreamerPlayer {
             if let Some(bus) = pipeline.bus() {
                 bus.set_sync_handler(|_bus, msg| {
                     use gst::MessageView;
+                    let source = msg
+                        .src()
+                        .map(|src| src.path_string())
+                        .unwrap_or_else(|| glib::GString::from("unknown"));
                     match msg.view() {
                         MessageView::Error(err) => {
                             tracing::error!(
+                                source = %source,
                                 error = %err.error(),
                                 debug = ?err.debug(),
-                                "GStreamer error"
+                                "GStreamer decoder/pipeline error"
                             );
                         }
                         MessageView::Warning(w) => {
                             tracing::warn!(
+                                source = %source,
                                 error = %w.error(),
                                 debug = ?w.debug(),
                                 "GStreamer warning"
                             );
                         }
                         MessageView::StateChanged(sc) => {
+                            let is_pipeline = msg
+                                .src()
+                                .and_then(|src| src.downcast_ref::<gst::Pipeline>())
+                                .is_some();
+                            if is_pipeline {
+                                tracing::info!(
+                                    source = %source,
+                                    old = ?sc.old(),
+                                    current = ?sc.current(),
+                                    pending = ?sc.pending(),
+                                    "GStreamer pipeline state changed"
+                                );
+                            }
                             // When sink goes PLAYING, retitle window.
                             if sc.current() == gst::State::Playing {
                                 #[cfg(windows)]
@@ -261,12 +595,26 @@ impl GStreamerPlayer {
         tracing::info!(
             window = WINDOW_TITLE,
             volume = vol,
-            "GStreamer ready — window title '{WINDOW_TITLE}'; PC volume keys: +/- m 0-9"
+            preview_mode = %preview_mode,
+            hardware_decode,
+            decoder = selected_decoder.factory_name(),
+            sink = selected_sink.factory_name(),
+            "GStreamer direct preview ready; PC volume: +/- m 0-9"
         );
 
         Ok(Self {
             h264_pipeline: Mutex::new(h264_pipeline),
             h264_src: Mutex::new(h264_src),
+            codec_gate: Mutex::new(CodecGate::default()),
+            selected_decoder,
+            selected_sink,
+            preview_mode,
+            hardware_decode,
+            queue_overruns,
+            appsrc_saturation_events,
+            waiting_config_drops: AtomicU64::new(0),
+            waiting_idr_drops: AtomicU64::new(0),
+            frames_pushed: AtomicU64::new(0),
             alac_pipeline: Mutex::new(alac_pipeline),
             alac_src: Mutex::new(alac_src),
             aac_eld_pipeline: Mutex::new(aac_eld_pipeline),
@@ -274,8 +622,10 @@ impl GStreamerPlayer {
             audio_compression: Mutex::new(None),
             hls_pipeline: Mutex::new(None),
             volume_milli,
+            airplay_volume_db_milli: AtomicI32::new(0),
             muted,
             volume_before_mute: Mutex::new(1.0),
+            last_size: Mutex::new((0, 0)),
             _main_loop_thread: Some(main_loop_thread),
             _volume_keys_thread: volume_keys_thread,
             main_loop_quit,
@@ -294,7 +644,11 @@ impl GStreamerPlayer {
         if let Ok(p) = self.aac_eld_pipeline.lock() {
             set_pipeline_volume(&p, "vol_aac", v);
         }
-        tracing::info!(linear = v, percent = (v * 100.0).round() as i32, "PC volume set");
+        tracing::info!(
+            linear = v,
+            percent = (v * 100.0).round() as i32,
+            "PC volume set"
+        );
     }
 
     pub fn volume(&self) -> f64 {
@@ -306,7 +660,10 @@ impl GStreamerPlayer {
             return;
         }
         let Ok(mut buffer) = gst::Buffer::with_size(data.len()) else {
-            tracing::warn!("gstreamer: failed to allocate buffer of size {}", data.len());
+            tracing::warn!(
+                "gstreamer: failed to allocate buffer of size {}",
+                data.len()
+            );
             return;
         };
         {
@@ -333,12 +690,116 @@ fn milli_to_volume(m: u32) -> f64 {
     m as f64 / 1000.0
 }
 
+fn airplay_db_to_linear(volume_db: f64) -> f64 {
+    let volume_db = volume_db.clamp(-144.0, 0.0);
+    if volume_db <= -144.0 {
+        0.0
+    } else {
+        10_f64.powf(volume_db / 20.0)
+    }
+}
+
 fn set_pipeline_volume(pipeline: &gst::Pipeline, name: &str, volume: f64) {
     if let Some(elem) = pipeline.by_name(name) {
         if elem.find_property("volume").is_some() {
             elem.set_property("volume", volume);
         }
     }
+}
+
+/// Pad probe: sample decoded BGRx frames for letterboxed landscape games (Hoyoverse-style).
+#[cfg(any())]
+fn install_letterbox_probe(pipeline: &gst::Pipeline, tracker: Arc<Mutex<ModeTracker>>) {
+    let Some(crop_el) = pipeline.by_name("vcrop") else {
+        tracing::warn!("videocrop missing; letterbox game detect disabled");
+        return;
+    };
+    let Some(pad) = crop_el.static_pad("sink") else {
+        tracing::warn!("videocrop sink pad missing");
+        return;
+    };
+
+    let counter = AtomicU64::new(0);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        if n % LETTERBOX_SAMPLE_EVERY != 0 {
+            return gst::PadProbeReturn::Ok;
+        }
+
+        let Some(buffer) = info.buffer() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(caps) = pad.current_caps() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(s) = caps.structure(0) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let width = s.get::<i32>("width").unwrap_or(0).max(0) as u32;
+        let height = s.get::<i32>("height").unwrap_or(0).max(0) as u32;
+        if width == 0 || height == 0 || width >= height {
+            // Landscape stream: size path already handles game mode.
+            return gst::PadProbeReturn::Ok;
+        }
+
+        let map = match buffer.map_readable() {
+            Ok(m) => m,
+            Err(_) => return gst::PadProbeReturn::Ok,
+        };
+        let data = map.as_slice();
+        // BGRx = 4 bytes/pixel; stride often = width * 4 (tight).
+        let bpp = 4usize;
+        let stride = (width as usize).saturating_mul(bpp);
+        if stride == 0 || data.len() < stride.saturating_mul(height as usize) {
+            return gst::PadProbeReturn::Ok;
+        }
+
+        let sample = detect_letterbox_game(data, width, height, stride, bpp);
+        let changed = {
+            let Ok(mut t) = tracker.lock() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            // Only letterbox-detect while stream is portrait (home advertise / tall frame).
+            if t.mode == ContentMode::GameLandscape && !t.crop.is_active() {
+                return gst::PadProbeReturn::Ok;
+            }
+            t.on_letterbox_sample(sample)
+        };
+
+        if changed {
+            if let Ok(t) = tracker.lock() {
+                if let Some(parent) = pad.parent_element() {
+                    for (prop, val) in [
+                        ("top", t.crop.top as i32),
+                        ("bottom", t.crop.bottom as i32),
+                        ("left", 0i32),
+                        ("right", 0i32),
+                    ] {
+                        if parent.find_property(prop).is_some() {
+                            parent.set_property(prop, val);
+                        }
+                    }
+                }
+                tracing::info!(
+                    content = t.mode.as_str(),
+                    crop_top = t.crop.top,
+                    crop_bottom = t.crop.bottom,
+                    width,
+                    height,
+                    "content mode (letterbox): {}",
+                    if t.mode == ContentMode::GameLandscape {
+                        "landscape game detected — cropped black bars"
+                    } else {
+                        "home / portrait UI"
+                    }
+                );
+            }
+        }
+
+        gst::PadProbeReturn::Ok
+    });
+
+    tracing::info!("letterbox game detector installed (portrait stream + black bars → crop)");
 }
 
 fn apply_window_title(pipeline: &gst::Pipeline, title: &str) {
@@ -354,6 +815,25 @@ fn apply_window_title(pipeline: &gst::Pipeline, title: &str) {
     }
     #[cfg(windows)]
     rename_d3d_windows(title);
+}
+
+fn apply_force_aspect_ratio(pipeline: &gst::Pipeline) {
+    // autovideosink creates its concrete child during state changes. Revisit
+    // the whole hierarchy so any compatible sink preserves sender geometry.
+    for item in pipeline.iterate_recurse() {
+        let Ok(element) = item else { continue };
+        if element.find_property("force-aspect-ratio").is_some() {
+            element.set_property("force-aspect-ratio", true);
+        }
+    }
+}
+
+fn install_aspect_ratio_handler(pipeline: &gst::Pipeline) {
+    pipeline.connect_deep_element_added(|_, _, element| {
+        if element.find_property("force-aspect-ratio").is_some() {
+            element.set_property("force-aspect-ratio", true);
+        }
+    });
 }
 
 /// Windows D3D sinks often ignore GStreamer title props and use "Direct3D12 Renderer".
@@ -422,15 +902,33 @@ impl AirPlayConsumer for GStreamerPlayer {
         tracing::info!(
             stream_connection_id = %info.stream_connection_id,
             window = WINDOW_TITLE,
-            "video format; starting GStreamer window '{WINDOW_TITLE}'"
+            decoder = self.selected_decoder.factory_name(),
+            hardware = self.selected_decoder.is_hardware(),
+            hardware_requested = self.hardware_decode,
+            sink = self.selected_sink.factory_name(),
+            preview_mode = %self.preview_mode,
+            "video format; starting direct GStreamer preview"
         );
+        if let Ok(mut gate) = self.codec_gate.lock() {
+            gate.reset();
+        }
+        self.waiting_config_drops.store(0, Ordering::Relaxed);
+        self.waiting_idr_drops.store(0, Ordering::Relaxed);
+        self.frames_pushed.store(0, Ordering::Relaxed);
+        self.queue_overruns.store(0, Ordering::Relaxed);
+        self.appsrc_saturation_events.store(0, Ordering::Relaxed);
+        if let Ok(mut s) = self.last_size.lock() {
+            *s = (0, 0);
+        }
         match self.h264_pipeline.lock() {
             Ok(p) => {
                 apply_window_title(&p, WINDOW_TITLE);
+                apply_force_aspect_ratio(&p);
                 if let Err(e) = p.set_state(gst::State::Playing) {
                     tracing::error!(error = %e, "failed to play H.264 pipeline");
                 }
                 apply_window_title(&p, WINDOW_TITLE);
+                apply_force_aspect_ratio(&p);
                 #[cfg(windows)]
                 rename_d3d_windows(WINDOW_TITLE);
             }
@@ -438,24 +936,107 @@ impl AirPlayConsumer for GStreamerPlayer {
         }
     }
 
+    fn on_video_size(&self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let changed = {
+            let mut last = match self.last_size.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if *last == (width, height) {
+                false
+            } else {
+                *last = (width, height);
+                true
+            }
+        };
+        if changed {
+            tracing::info!(
+                width,
+                height,
+                aspect_ratio = width as f64 / height as f64,
+                "video resolution changed; preserving sender geometry"
+            );
+        }
+    }
+
     fn on_video(&self, data: &[u8]) {
-        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let gated = match self.codec_gate.lock() {
+            Ok(mut gate) => gate.push(data),
+            Err(error) => {
+                tracing::error!(%error, "H.264 codec gate mutex poisoned");
+                return;
+            }
+        };
+        let access_unit = match gated {
+            GateResult::CodecConfigUpdated => {
+                tracing::info!(bytes = data.len(), "updated H.264 SPS/PPS; waiting for IDR");
+                return;
+            }
+            GateResult::WaitingForConfig => {
+                let dropped = self.waiting_config_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped <= 5 || dropped % 120 == 0 {
+                    tracing::warn!(
+                        dropped,
+                        bytes = data.len(),
+                        "missing SPS/PPS; dropping access unit"
+                    );
+                }
+                return;
+            }
+            GateResult::WaitingForIdr => {
+                let dropped = self.waiting_idr_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped <= 5 || dropped % 120 == 0 {
+                    tracing::warn!(
+                        dropped,
+                        bytes = data.len(),
+                        "waiting for IDR; dropping inter frame"
+                    );
+                }
+                return;
+            }
+            GateResult::Rejected(error) => {
+                tracing::warn!(%error, bytes = data.len(), "rejected H.264 input buffer");
+                return;
+            }
+            GateResult::AccessUnit(access_unit) => access_unit,
+        };
+        let n = self.frames_pushed.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 {
             #[cfg(windows)]
             rename_d3d_windows(WINDOW_TITLE);
-            tracing::info!(bytes = data.len(), "first frame → window '{WINDOW_TITLE}'");
+            tracing::info!(
+                bytes = access_unit.len(),
+                "first complete access unit to preview"
+            );
         } else if n % 120 == 0 {
-            tracing::info!(n, bytes = data.len(), "gstreamer push H.264");
+            tracing::info!(
+                n,
+                bytes = access_unit.len(),
+                "gstreamer push H.264 access unit"
+            );
         }
         match self.h264_src.lock() {
-            Ok(src) => Self::push_to_appsrc(&src, data),
+            Ok(src) => Self::push_to_appsrc(&src, &access_unit),
             Err(e) => tracing::error!(error = %e, "H.264 appsrc mutex poisoned"),
         }
     }
 
     fn on_video_src_disconnect(&self) {
         tracing::info!("video source disconnected; stopping H.264 pipeline");
+        if let Ok(mut gate) = self.codec_gate.lock() {
+            gate.reset();
+        }
+        self.waiting_config_drops.store(0, Ordering::Relaxed);
+        self.waiting_idr_drops.store(0, Ordering::Relaxed);
+        self.frames_pushed.store(0, Ordering::Relaxed);
+        self.queue_overruns.store(0, Ordering::Relaxed);
+        self.appsrc_saturation_events.store(0, Ordering::Relaxed);
+        if let Ok(mut size) = self.last_size.lock() {
+            *size = (0, 0);
+        }
         match self.h264_pipeline.lock() {
             Ok(p) => {
                 let _ = p.set_state(gst::State::Null);
@@ -465,7 +1046,10 @@ impl AirPlayConsumer for GStreamerPlayer {
     }
 
     fn on_audio_format(&self, info: &AudioStreamInfo) {
-        tracing::info!(?info, "audio format; PC volume applies to this stream (not phone)");
+        tracing::info!(
+            ?info,
+            "audio format; PC volume applies to this stream (not phone)"
+        );
         if let Ok(mut ct) = self.audio_compression.lock() {
             *ct = info.compression_type;
         }
@@ -506,7 +1090,10 @@ impl AirPlayConsumer for GStreamerPlayer {
                 }
             }
             other => {
-                tracing::trace!(?other, "ignoring audio (unsupported or unknown compression)");
+                tracing::trace!(
+                    ?other,
+                    "ignoring audio (unsupported or unknown compression)"
+                );
             }
         }
     }
@@ -521,6 +1108,19 @@ impl AirPlayConsumer for GStreamerPlayer {
         if let Ok(mut ct) = self.audio_compression.lock() {
             *ct = None;
         }
+    }
+
+    fn on_volume(&self, volume_db: f64) {
+        let volume_db = volume_db.clamp(-144.0, 0.0);
+        let linear = airplay_db_to_linear(volume_db);
+        self.airplay_volume_db_milli
+            .store((volume_db * 1000.0).round() as i32, Ordering::Relaxed);
+        self.set_volume(linear);
+        tracing::info!(volume_db, linear, "AirPlay phone volume applied");
+    }
+
+    fn volume(&self) -> Option<f64> {
+        Some(self.airplay_volume_db_milli.load(Ordering::Relaxed) as f64 / 1000.0)
     }
 
     fn on_media_playlist(&self, playlist_uri: &str) {
@@ -579,10 +1179,7 @@ impl AirPlayConsumer for GStreamerPlayer {
                     .query_position::<gst::ClockTime>()
                     .map(|t| t.seconds() as f64)
                     .unwrap_or(0.0);
-                return PlaybackInfo {
-                    duration,
-                    position,
-                };
+                return PlaybackInfo { duration, position };
             }
         }
         PlaybackInfo {
@@ -618,5 +1215,87 @@ impl Drop for GStreamerPlayer {
             let _ = handle;
         }
         let _ = self.volume_before_mute;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DecoderChoice, PreviewMode, SinkChoice};
+
+    #[test]
+    fn airplay_db_maps_to_linear_gstreamer_gain() {
+        assert_eq!(airplay_db_to_linear(0.0), 1.0);
+        assert!((airplay_db_to_linear(-20.0) - 0.1).abs() < 1e-12);
+        assert_eq!(airplay_db_to_linear(-144.0), 0.0);
+        assert_eq!(airplay_db_to_linear(-200.0), 0.0);
+        assert_eq!(airplay_db_to_linear(6.0), 1.0);
+    }
+
+    #[test]
+    fn direct_pipeline_has_required_caps_and_no_processing_or_encoding() {
+        let text = video_pipeline_description(
+            DecoderChoice::D3d11H264Dec,
+            SinkChoice::D3d11VideoSink,
+            PreviewMode::Balanced.options(),
+        );
+        for required in [
+            "block=false",
+            "max-buffers=3",
+            "max-bytes=4194304",
+            "leaky-type=downstream",
+            "stream-format=byte-stream",
+            "alignment=au",
+            "max-size-buffers=3",
+            "leaky=downstream",
+            "h264parse config-interval=-1",
+            "d3d11h264dec",
+            "d3d11videosink",
+            "force-aspect-ratio=true",
+            "sync=true",
+        ] {
+            assert!(text.contains(required), "missing {required}: {text}");
+        }
+        for forbidden in [
+            "x264enc",
+            "openh264enc",
+            "jpeg",
+            "png",
+            "videoscale",
+            "videocrop",
+            "videoflip",
+            "BGRx",
+        ] {
+            assert!(!text.contains(forbidden), "forbidden {forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn quality_pipeline_bounds_nonblocking_appsrc_without_leaking_downstream_queue() {
+        let text = video_pipeline_description(
+            DecoderChoice::AvdecH264,
+            SinkChoice::AutoVideoSink,
+            PreviewMode::Quality.options(),
+        );
+        assert!(text.contains("block=false"));
+        assert!(text.contains("max-buffers=8"));
+        assert!(text.contains("max-bytes=4194304"));
+        assert!(text.contains("leaky-type=upstream"));
+        assert!(text.contains("max-size-buffers=8"));
+        assert!(text.contains("leaky=no"));
+    }
+
+    #[test]
+    #[ignore = "requires an installed GStreamer runtime and Windows video plugins"]
+    fn installed_windows_pipeline_preflights() {
+        gst::init().unwrap();
+        let (pipeline, _src, decoder, sink, _overruns, _saturation_events) =
+            build_video_pipeline(PreviewMode::Balanced, true).unwrap();
+        assert_eq!(decoder, DecoderChoice::D3d11H264Dec);
+        assert_eq!(sink, SinkChoice::D3d11VideoSink);
+        let (transition, current, _) = pipeline.state(gst::ClockTime::ZERO);
+        assert!(transition.is_ok());
+        assert_eq!(current, gst::State::Ready);
+        pipeline.set_state(gst::State::Null).unwrap();
     }
 }

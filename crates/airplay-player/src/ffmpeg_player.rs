@@ -19,6 +19,29 @@ use airplay_server::AirPlayConsumer;
 
 const MAX_BUFFER: usize = 4 * 1024 * 1024;
 
+/// Orientation for ffplay (`transpose` filter).
+///
+/// **Auto:** no transpose — default portrait UI; landscape when stream is wide (games).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfmpegRotateMode {
+    #[default]
+    Auto,
+    None,
+    Cw,
+    Ccw,
+}
+
+impl FfmpegRotateMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "0" => Self::None,
+            "cw" | "clockwise" | "right" | "90" => Self::Cw,
+            "ccw" | "counterclockwise" | "counter-clockwise" | "left" | "270" => Self::Ccw,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Live window via `ffplay`.
 pub struct FFmpegPlayer {
     ffplay_path: PathBuf,
@@ -32,12 +55,21 @@ pub struct FFmpegPlayer {
     use_file_mode: AtomicBool,
     last_restart: Mutex<Instant>,
     frames: AtomicU64,
+    rotate_mode: FfmpegRotateMode,
+    /// Last reported stream size; drives transpose filter.
+    last_size: Mutex<(u32, u32)>,
+    /// Active transpose filter for next spawn (`None` = no -vf).
+    vf_transpose: Mutex<Option<&'static str>>,
 }
 
 impl FFmpegPlayer {
     pub fn new() -> Result<Self, String> {
+        Self::with_rotate(FfmpegRotateMode::Auto)
+    }
+
+    pub fn with_rotate(rotate_mode: FfmpegRotateMode) -> Result<Self, String> {
         let ffplay_path = resolve_ffplay()?;
-        tracing::info!(path = %ffplay_path.display(), "ffplay resolved");
+        tracing::info!(path = %ffplay_path.display(), ?rotate_mode, "ffplay resolved");
         Ok(Self {
             ffplay_path,
             dump_path: Mutex::new(None),
@@ -48,6 +80,9 @@ impl FFmpegPlayer {
             use_file_mode: AtomicBool::new(false),
             last_restart: Mutex::new(Instant::now() - Duration::from_secs(5)),
             frames: AtomicU64::new(0),
+            rotate_mode,
+            last_size: Mutex::new((0, 0)),
+            vf_transpose: Mutex::new(None),
         })
     }
 
@@ -94,6 +129,17 @@ impl FFmpegPlayer {
         }
     }
 
+    fn transpose_for(&self, width: u32, height: u32) -> Option<&'static str> {
+        // FFmpeg transpose: 1 = 90° CW, 2 = 90° CCW.
+        // Auto/None: no filter — portrait stream stays upright; landscape = game.
+        let _ = (width, height);
+        match self.rotate_mode {
+            FfmpegRotateMode::None | FfmpegRotateMode::Auto => None,
+            FfmpegRotateMode::Cw => Some("transpose=1"),
+            FfmpegRotateMode::Ccw => Some("transpose=2"),
+        }
+    }
+
     fn spawn_stdin_mode(&self) -> Result<(), String> {
         let mut cmd = Command::new(&self.ffplay_path);
         cmd.args([
@@ -113,12 +159,16 @@ impl FFmpegPlayer {
             "5000000",
             "-analyzeduration",
             "5000000",
-            "-i",
-            "pipe:0",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        ]);
+        if let Ok(vf) = self.vf_transpose.lock() {
+            if let Some(filter) = *vf {
+                cmd.args(["-vf", filter]);
+            }
+        }
+        cmd.args(["-i", "pipe:0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         let mut child = cmd.spawn().map_err(|e| {
             format!(
@@ -179,12 +229,9 @@ impl FFmpegPlayer {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-        let child = cmd.spawn().map_err(|e| {
-            format!(
-                "file-mode spawn {} failed: {e}",
-                self.ffplay_path.display()
-            )
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("file-mode spawn {} failed: {e}", self.ffplay_path.display()))?;
 
         *self.child.lock().map_err(|e| e.to_string())? = Some(child);
         *self.stdin.lock().map_err(|e| e.to_string())? = None;
@@ -367,7 +414,59 @@ impl AirPlayConsumer for FFmpegPlayer {
         if let Ok(mut p) = self.pending.lock() {
             p.clear();
         }
+        if let Ok(mut s) = self.last_size.lock() {
+            *s = (0, 0);
+        }
+        if let Ok(mut v) = self.vf_transpose.lock() {
+            *v = None;
+        }
         self.frames.store(0, Ordering::SeqCst);
+    }
+
+    fn on_video_size(&self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let new_vf = self.transpose_for(width, height);
+        let (size_changed, vf_changed) = {
+            let mut last = match self.last_size.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let size_changed = *last != (width, height);
+            if size_changed {
+                *last = (width, height);
+            }
+            let mut vf = match self.vf_transpose.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let vf_changed = *vf != new_vf;
+            if vf_changed {
+                *vf = new_vf;
+            }
+            (size_changed, vf_changed)
+        };
+        if size_changed || vf_changed {
+            let portrait = height > width;
+            tracing::info!(
+                width,
+                height,
+                portrait,
+                mode = if portrait {
+                    "portrait (default home/UI)"
+                } else {
+                    "landscape (game/app detected)"
+                },
+                ?new_vf,
+                "ffplay orientation"
+            );
+        }
+        // Restart player so -vf applies (only if already running).
+        if vf_changed && self.started.load(Ordering::SeqCst) && self.throttle_restart() {
+            tracing::info!("restarting ffplay for orientation change");
+            self.stop_process();
+        }
     }
 
     fn on_video(&self, data: &[u8]) {

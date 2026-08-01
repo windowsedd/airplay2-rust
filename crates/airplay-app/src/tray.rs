@@ -84,9 +84,7 @@ fn run_tray_event_loop(info: TrayInfo, cmd_tx: Sender<TrayCommand>) -> Result<()
         // Prefer any_thread if Wayland builder also needs it for off-main tray.
         let _ = builder.with_any_thread(true);
     }
-    let event_loop = builder
-        .build()
-        .map_err(|e| format!("event loop: {e}"))?;
+    let event_loop = builder.build().map_err(|e| format!("event loop: {e}"))?;
 
     let proxy = event_loop.create_proxy();
     let proxy_menu = proxy.clone();
@@ -113,14 +111,12 @@ fn run_tray_event_loop(info: TrayInfo, cmd_tx: Sender<TrayCommand>) -> Result<()
         .map_err(|e| format!("menu: {e}"))?;
     menu.append(&item_config)
         .map_err(|e| format!("menu: {e}"))?;
-    menu.append(&item_dump)
-        .map_err(|e| format!("menu: {e}"))?;
+    menu.append(&item_dump).map_err(|e| format!("menu: {e}"))?;
     menu.append(&item_folder)
         .map_err(|e| format!("menu: {e}"))?;
     menu.append(&PredefinedMenuItem::separator())
         .map_err(|e| format!("menu: {e}"))?;
-    menu.append(&item_exit)
-        .map_err(|e| format!("menu: {e}"))?;
+    menu.append(&item_exit).map_err(|e| format!("menu: {e}"))?;
 
     let tooltip = format!(
         "airplay2-rust\n{}\nport {} · {} · {}x{}@{}fps",
@@ -305,8 +301,12 @@ fn message_box(title: &str, body: &str) {
 
     #[link(name = "user32")]
     extern "system" {
-        fn MessageBoxW(h_wnd: HWND, lp_text: *const u16, lp_caption: *const u16, u_type: UINT)
-            -> i32;
+        fn MessageBoxW(
+            h_wnd: HWND,
+            lp_text: *const u16,
+            lp_caption: *const u16,
+            u_type: UINT,
+        ) -> i32;
     }
 
     fn wide(s: &str) -> Vec<u16> {

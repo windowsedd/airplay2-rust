@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 
 use crate::consumer::AirPlayConsumer;
 use crate::packet::video::{
-    parse_video_header, prepare_picture_nal_units, prepare_sps_pps_nal_units, VIDEO_HEADER_LEN,
+    parse_video_header, parse_video_size, prepare_picture_nal_units, prepare_sps_pps_nal_units,
+    VIDEO_HEADER_LEN,
 };
 
 /// Bind an ephemeral TCP port for video data.
@@ -58,6 +59,7 @@ async fn handle_video_connection(
     let mut packets: u64 = 0;
     let mut frames_out: u64 = 0;
     let mut decrypt_fail: u64 = 0;
+    let mut malformed_picture: u64 = 0;
     loop {
         let mut header = [0u8; VIDEO_HEADER_LEN];
         stream.read_exact(&mut header).await?;
@@ -73,7 +75,11 @@ async fn handle_video_connection(
         let size = hdr.payload_size as usize;
         // Guard absurd sizes (corrupt header) so we don't OOM.
         if size > 16 * 1024 * 1024 {
-            warn!(size, payload_type = hdr.payload_type, "video payload too large; drop connection");
+            warn!(
+                size,
+                payload_type = hdr.payload_type,
+                "video payload too large; drop connection"
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "video payload too large",
@@ -115,17 +121,49 @@ async fn handle_video_connection(
                 if !decrypt_ok {
                     continue;
                 }
-                prepare_picture_nal_units(&mut payload);
+                let _nal_units = match prepare_picture_nal_units(&mut payload) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        malformed_picture += 1;
+                        if malformed_picture <= 5 || malformed_picture % 60 == 0 {
+                            warn!(
+                                malformed_picture,
+                                bytes = payload.len(),
+                                %error,
+                                "rejecting malformed AVCC picture"
+                            );
+                        }
+                        continue;
+                    }
+                };
                 frames_out += 1;
                 if frames_out == 1 {
-                    info!(bytes = payload.len(), "first decrypted video frame → consumer");
+                    info!(
+                        bytes = payload.len(),
+                        "first decrypted video frame → consumer"
+                    );
                 }
                 consumer.on_video(&payload);
             }
             1 => {
-                // SPS/PPS — no decrypt.
+                // SPS/PPS — no decrypt. Header also carries stream width/height floats.
                 match prepare_sps_pps_nal_units(&payload) {
                     Some(annex_b) => {
+                        if let Some(size) = parse_video_size(&header) {
+                            let w = size.width_px();
+                            let h = size.height_px();
+                            if w > 0 && h > 0 {
+                                info!(
+                                    width = w,
+                                    height = h,
+                                    portrait = size.is_portrait(),
+                                    width_source = size.width_source,
+                                    height_source = size.height_source,
+                                    "video size from validated SPS/PPS header"
+                                );
+                                consumer.on_video_size(w, h);
+                            }
+                        }
                         frames_out += 1;
                         info!(bytes = annex_b.len(), "SPS/PPS annex-B → consumer");
                         consumer.on_video(&annex_b);
@@ -134,11 +172,7 @@ async fn handle_video_connection(
                 }
             }
             other => {
-                debug!(
-                    payload_type = other,
-                    length = size,
-                    "video packet skipped"
-                );
+                debug!(payload_type = other, length = size, "video packet skipped");
             }
         }
     }

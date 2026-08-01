@@ -4,10 +4,12 @@
 //!
 //! # Platform notes
 //!
-//! Registration uses the [`mdns-sd`](https://crates.io/crates/mdns-sd) crate (works on Windows,
-//! macOS, and Linux). Binding UDP port 5353 may require elevated privileges or firewall
-//! allowances on some systems; `start` soft-fails (logs + returns `Ok`) when the daemon or
-//! interface enumeration cannot advertise, so callers are never panicked for missing NICs.
+//! Registration uses the [`mdns-sd`](https://crates.io/crates/mdns-sd) crate.
+//! Supported receiver platforms are **Windows** (primary) and optionally **Linux**;
+//! macOS is not a project build/run target. Binding UDP port 5353 may require elevated
+//! privileges or firewall allowances; `start` soft-fails (logs + returns `Ok`) when the
+//! daemon or interface enumeration cannot advertise, so callers are never panicked for
+//! missing NICs.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
