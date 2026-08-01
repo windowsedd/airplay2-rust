@@ -1,15 +1,22 @@
-# Workspace cargo config — plain `cargo run` builds airplay-app with GStreamer.
+# Workspace cargo config
 #
-# Windows GStreamer: pkg-config.exe lives in GStreamer bin. These env vars apply
-# when you run cargo from this workspace (override by setting them yourself first).
+# Default features include GStreamer. On Windows the built EXE needs GStreamer
+# DLLs at *runtime* (PATH), not only at compile time — otherwise you get:
+#   exit code 0xC0000135 STATUS_DLL_NOT_FOUND
+#
+# [env] only affects build scripts/rustc, NOT cargo run of the final binary.
+# The [target.*.runner] wraps cargo run / cargo test so PATH is set first.
 
 [alias]
 run-airplay = "run -p airplay-app"
 build-airplay = "build -p airplay-app --release"
 
 [env]
-# Default MSVC x86_64 install path (GStreamer 1.x)
+# Compile-time: pkg-config for gstreamer-sys
 GSTREAMER_1_0_ROOT_MSVC_X86_64 = { value = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64", force = false }
 PKG_CONFIG_PATH = { value = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\lib\\pkgconfig", force = false }
-# So build scripts find pkg-config.exe next to gstreamer-1.0.pc
 PATH = { value = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\bin", prepend = true, force = false }
+
+# Runtime: cargo run / cargo test
+[target.x86_64-pc-windows-msvc]
+runner = ["cmd", "/C", "scripts\\gst-runner.cmd"]

@@ -71,8 +71,25 @@ output = "dump.h264"
 "@ | Set-Content -Encoding utf8 $configDst
 }
 
+# Small launcher so double-click / dist run finds GStreamer DLLs
+$launcher = Join-Path $dist "run-airplay.cmd"
+@"
+@echo off
+set "GST_ROOT=%GSTREAMER_1_0_ROOT_MSVC_X86_64%"
+if "%GST_ROOT%"=="" set "GST_ROOT=C:\Program Files\gstreamer\1.0\msvc_x86_64"
+set "PATH=%GST_ROOT%\bin;%PATH%"
+set "GST_PLUGIN_PATH=%GST_ROOT%\lib\gstreamer-1.0"
+if exist "%~dp0assets" set "PATH=%PATH%"
+cd /d "%~dp0"
+airplay-app.exe %*
+"@ | Set-Content -Encoding ascii $launcher
+
 Write-Host ""
-Write-Host "Done. Run:" -ForegroundColor Cyan
-Write-Host "  dist\airplay-app.exe"
-Write-Host "  (GStreamer runtime bin should be on PATH for live A/V)"
-Write-Host "  player.implementation = auto (GStreamer primary)"
+Write-Host "Done." -ForegroundColor Cyan
+Write-Host "  Do NOT run airplay-app.exe alone if GStreamer is not on system PATH."
+Write-Host "  Use:"
+Write-Host "    dist\run-airplay.cmd"
+Write-Host "  or:"
+Write-Host "    `$env:Path = 'C:\Program Files\gstreamer\1.0\msvc_x86_64\bin;' + `$env:Path"
+Write-Host "    .\dist\airplay-app.exe"
+

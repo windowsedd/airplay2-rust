@@ -1,14 +1,11 @@
 # airplay2-rust - Windows run helper
 #
-# Default: GStreamer + dump + ffplay (same as plain cargo run when GST is installed)
+# Default: GStreamer + dump + ffplay fallback
 #   .\run.ps1
-#   cargo run
+#   cargo run   (also uses scripts\gst-runner.cmd so DLLs are found)
 #
-# Without GStreamer (ffplay + dump only):
+# Without GStreamer:
 #   .\run.ps1 -NoGStreamer
-#
-# Release .exe:
-#   .\build-release.ps1
 #
 # Options:
 #   -NoGStreamer  omit gstreamer feature
@@ -24,15 +21,15 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-# FFmpeg / ffplay (Chocolatey or other)
-$chocoBin = "C:\ProgramData\chocolatey\bin"
-if (Test-Path $chocoBin) {
-    $env:Path = "$chocoBin;" + $env:Path
+function Add-PathFront([string]$dir) {
+    if ($dir -and (Test-Path $dir)) {
+        $env:Path = "$dir;" + $env:Path
+    }
 }
-$realFfplay = "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin"
-if (Test-Path $realFfplay) {
-    $env:Path = "$realFfplay;" + $env:Path
-}
+
+# FFmpeg (real tools first, then Chocolatey bin)
+Add-PathFront "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin"
+Add-PathFront "C:\ProgramData\chocolatey\bin"
 
 $gstRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
 if (-not $gstRoot) {
@@ -44,23 +41,27 @@ $useGst = -not $NoGStreamer
 
 if ($useGst) {
     if (-not (Test-Path $gstRoot)) {
-        Write-Host "GStreamer not found at '$gstRoot' - building without gstreamer feature." -ForegroundColor Yellow
-        Write-Host "Install MSVC x86_64 from https://gstreamer.freedesktop.org/download/" -ForegroundColor Yellow
+        Write-Host "GStreamer not found at '$gstRoot' - building without gstreamer." -ForegroundColor Yellow
         $useGst = $false
     } else {
         $gstBin = Join-Path $gstRoot "bin"
-        $gstPc = Join-Path $gstRoot "lib\pkgconfig"
-        $env:Path = "$gstBin;" + $env:Path
-        $env:PKG_CONFIG_PATH = $gstPc
-        $env:GST_PLUGIN_PATH = (Join-Path $gstRoot "lib\gstreamer-1.0")
+        Add-PathFront $gstBin
+        $env:PKG_CONFIG_PATH = Join-Path $gstRoot "lib\pkgconfig"
+        $env:GST_PLUGIN_PATH = Join-Path $gstRoot "lib\gstreamer-1.0"
         $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $gstRoot
         $features += "gstreamer"
-        Write-Host "GStreamer enabled (default): $gstRoot" -ForegroundColor Cyan
-        $pkg = Get-Command pkg-config -ErrorAction SilentlyContinue
-        if (-not $pkg) {
-            Write-Error "pkg-config.exe not on PATH. Expected at $gstBin\pkg-config.exe"
+        Write-Host "GStreamer (runtime + build): $gstRoot" -ForegroundColor Cyan
+        Write-Host "  PATH includes: $gstBin" -ForegroundColor DarkGray
+        if (-not (Test-Path (Join-Path $gstBin "pkg-config.exe"))) {
+            Write-Warning "pkg-config.exe missing under GStreamer bin - compile may fail."
         }
-        Write-Host "  pkg-config: $($pkg.Source)" -ForegroundColor DarkGray
+        # Spot-check a core DLL so we fail early with a clear message
+        $dll = Get-ChildItem $gstBin -Filter "gstreamer-1.0*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $dll) {
+            Write-Warning "No gstreamer-1.0*.dll in $gstBin - install GStreamer MSVC runtime."
+        } else {
+            Write-Host "  Found: $($dll.Name)" -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -72,9 +73,11 @@ if ($BuildOnly) {
     exit $LASTEXITCODE
 }
 
+# cargo run uses gst-runner.cmd for DLL PATH; we already set PATH for this shell too.
 if (-not (Test-Path $Config)) {
-    Write-Host "No $Config - cargo run will create defaults (player=auto)." -ForegroundColor Yellow
+    Write-Host "No $Config - using cargo defaults (player=auto)." -ForegroundColor Yellow
     cargo run -p airplay-app --features $feat
 } else {
     cargo run -p airplay-app --features $feat -- --config $Config
 }
+exit $LASTEXITCODE

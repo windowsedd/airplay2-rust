@@ -141,15 +141,21 @@ Plain **`cargo run`** defaults to features **`h264-dump` + `ffmpeg` + `gstreamer
 2. **h264-dump** — `dump.h264`  
 3. **ffplay** — optional secondary video window  
 
-Windows: GStreamer MSVC must be installed; `.cargo/config.toml` prepends its `bin` (pkg-config) and `PKG_CONFIG_PATH`. Or use:
+Windows: install **GStreamer MSVC x86_64** (runtime + dev).  
+If you see **`0xC0000135 STATUS_DLL_NOT_FOUND`**, GStreamer `bin` is not on **PATH** when the exe starts.
 
 ```powershell
 cd F:\airplay2-rust
-.\run.ps1              # sets GStreamer env + cargo run (default)
-cargo run              # same features if .cargo/config.toml GST paths work
 
-.\build-release.ps1    # release .exe with GStreamer
-.\dist\airplay-app.exe
+# Recommended (sets PATH for DLLs + pkg-config)
+.\run.ps1
+
+# cargo run also uses scripts\gst-runner.cmd (via .cargo/config.toml runner)
+cargo run
+
+# Release package — use the launcher, not the bare exe:
+.\build-release.ps1
+.\dist\run-airplay.cmd
 
 # Without GStreamer:
 .\run.ps1 -NoGStreamer
