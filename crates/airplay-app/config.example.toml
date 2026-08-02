@@ -18,3 +18,5 @@ hardware_decode = true
 auto_rotate = true
 rotate = "auto"
 detect_game = true
+# AirPlay volume: player (GStreamer gain) | system | disabled
+volume_sync = "player"

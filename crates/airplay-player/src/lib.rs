@@ -32,11 +32,14 @@ mod ffmpeg_player;
 #[cfg(feature = "vlc")]
 mod vlc_player;
 
+mod lifecycle;
 mod orientation;
 mod preview;
+mod system_volume;
 mod tee;
 
 pub use h264::{classify_annex_b, CodecGate, GateResult, H264InputError, NalKinds};
+pub use lifecycle::{GenerationGate, PlayerLifecycle, PlayerState};
 pub use orientation::{
     detect_letterbox_game, mode_from_stream_size, ContentMode, LetterboxCrop, LetterboxDetect,
     ModeTracker,
@@ -44,6 +47,11 @@ pub use orientation::{
 pub use preview::{
     decoder_candidates, select_decoder, select_sink, sink_candidates, DecoderChoice, PreviewMode,
     PreviewOptions, SinkChoice,
+};
+pub use system_volume::{
+    airplay_db_is_mute, airplay_db_to_amplitude, create_system_volume_controller,
+    NoopSystemVolumeController, RecordingSystemVolumeController, SystemVolumeController,
+    VolumeSyncMode, AIRPLAY_MUTE_DB_THRESHOLD,
 };
 
 #[cfg(feature = "h264-dump")]

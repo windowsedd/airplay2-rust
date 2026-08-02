@@ -25,7 +25,8 @@ refresh_rate = 60
 [player]
 implementation = "gstreamer"
 output = "dump.h264"
-preview_mode = "low-latency"
+# balanced keeps A/V sink sync; low-latency still syncs sinks (leaky queues only).
+preview_mode = "balanced"
 hardware_decode = true
 
 # Legacy orientation controls for ffplay/processed renderers. The direct
@@ -33,3 +34,5 @@ hardware_decode = true
 auto_rotate = true
 rotate = "auto"
 detect_game = true
+# AirPlay volume: player (GStreamer gain) | system | disabled
+volume_sync = "player"

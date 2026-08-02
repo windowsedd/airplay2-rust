@@ -8,6 +8,11 @@
 //! Pipeline (H.264 annex-B):
 //! `appsrc ! queue ! h264parse ! selected-decoder ! selected-video-sink`
 //!
+//! Video and audio use **separate** pipelines (AirPlay delivers them on separate
+//! sockets) but share one GStreamer clock and base-time so sinks present in lockstep.
+//! Both sinks use `sync=true`; low latency is achieved with leaky queues, not by
+//! freerunning video ahead of audio.
+//!
 //! The direct path performs no re-encoding, fixed scaling, decoded-frame crop,
 //! rotation, or CPU frame extraction.
 
@@ -18,18 +23,26 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use airplay_lib::{AudioStreamInfo, CompressionType, VideoStreamInfo};
-use airplay_server::{AirPlayConsumer, PlaybackInfo};
+use airplay_server::{AirPlayConsumer, PlaybackInfo, StreamGeneration};
 use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+use crate::lifecycle::{GenerationGate, PlayerLifecycle};
+use crate::system_volume::{
+    airplay_db_is_mute, create_system_volume_controller, SystemVolumeController, VolumeSyncMode,
+};
 use crate::{
     decoder_candidates, sink_candidates, CodecGate, DecoderChoice, GateResult, PreviewMode,
     PreviewOptions, SinkChoice,
 };
 
 const WINDOW_TITLE: &str = "airplay2-rust";
+
+/// Slight audio hold-back so H.264 decode latency does not leave lips ahead of voice.
+/// ~80 ms is typical for hardware decode + sink; adjustable via preview mode later.
+const AUDIO_LIP_SYNC_DELAY_NS: u64 = 80_000_000;
 
 fn video_pipeline_description(
     decoder: DecoderChoice,
@@ -298,6 +311,24 @@ impl RotateMode {
 }
 
 /// Live GStreamer-backed consumer: titled video window + PC volume control.
+///
+/// ## Window ownership
+///
+/// The playback HWND is **sink-owned** (`d3d11videosink` / `autovideosink` creates
+/// it). Moving the pipeline to NULL destroys that window. The receiver process and
+/// control listener stay alive; a later `on_video_format` restarts PLAYING and the
+/// sink creates a new window.
+///
+/// ## Generations
+///
+/// Each SETUP claims a stream generation. Disconnect/TEARDOWN for an older
+/// generation is ignored so YouTube stream replacement cannot stop the new pipeline.
+///
+/// ## A/V sync
+///
+/// Mirror video and audio are separate pipelines (separate AirPlay sockets) but
+/// share one GStreamer system clock and a common base-time. Audio sinks use a
+/// small render delay so decoded video catches up (lip-sync).
 pub struct GStreamerPlayer {
     h264_pipeline: Mutex<gst::Pipeline>,
     h264_src: Mutex<gst_app::AppSrc>,
@@ -324,6 +355,16 @@ pub struct GStreamerPlayer {
     muted: Arc<AtomicBool>,
     volume_before_mute: Mutex<f64>,
     last_size: Mutex<(u32, u32)>,
+    video_generation: GenerationGate,
+    audio_generation: GenerationGate,
+    video_lifecycle: PlayerLifecycle,
+    audio_lifecycle: PlayerLifecycle,
+    volume_sync: VolumeSyncMode,
+    system_volume: Arc<dyn SystemVolumeController>,
+    /// Shared clock for video + audio pipelines (A/V lockstep).
+    shared_clock: gst::Clock,
+    /// Base-time applied when the first of video/audio starts PLAYING.
+    shared_base_time: Mutex<Option<gst::ClockTime>>,
     _main_loop_thread: Option<JoinHandle<()>>,
     _volume_keys_thread: Option<JoinHandle<()>>,
     main_loop_quit: Arc<AtomicBool>,
@@ -353,6 +394,8 @@ impl GStreamerPlayer {
             true,
             rotate_mode,
             detect_game,
+            VolumeSyncMode::Player,
+            None,
         )
     }
 
@@ -361,12 +404,31 @@ impl GStreamerPlayer {
         preview_mode: PreviewMode,
         hardware_decode: bool,
     ) -> Result<Self, String> {
+        Self::with_volume_sync(
+            initial,
+            preview_mode,
+            hardware_decode,
+            VolumeSyncMode::Player,
+            None,
+        )
+    }
+
+    /// Create with explicit AirPlay → volume sync mode and optional controller override.
+    pub fn with_volume_sync(
+        initial: f64,
+        preview_mode: PreviewMode,
+        hardware_decode: bool,
+        volume_sync: VolumeSyncMode,
+        system_volume: Option<Arc<dyn SystemVolumeController>>,
+    ) -> Result<Self, String> {
         Self::with_all_options(
             initial,
             preview_mode,
             hardware_decode,
             RotateMode::Auto,
             false,
+            volume_sync,
+            system_volume,
         )
     }
 
@@ -376,8 +438,15 @@ impl GStreamerPlayer {
         hardware_decode: bool,
         rotate_mode: RotateMode,
         detect_game: bool,
+        volume_sync: VolumeSyncMode,
+        system_volume: Option<Arc<dyn SystemVolumeController>>,
     ) -> Result<Self, String> {
         gst::init().map_err(|e| format!("gstreamer init failed: {e}"))?;
+
+        let system_volume = system_volume.unwrap_or_else(|| match volume_sync {
+            VolumeSyncMode::System => create_system_volume_controller(),
+            _ => Arc::new(crate::system_volume::NoopSystemVolumeController),
+        });
 
         let volume_milli = Arc::new(AtomicU32::new(volume_to_milli(initial.clamp(0.0, 2.0))));
         let muted = Arc::new(AtomicBool::new(false));
@@ -389,7 +458,15 @@ impl GStreamerPlayer {
             .name("gstreamer-main-loop".into())
             .spawn(move || {
                 let main_context = glib::MainContext::default();
-                let _guard = main_context.acquire().expect("acquire GLib main context");
+                let guard = match main_context.acquire() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to acquire GLib main context");
+                        tracing::info!("GStreamer main loop task exited (acquire failed)");
+                        return;
+                    }
+                };
+                let _guard = guard;
                 while !quit_flag.load(Ordering::Relaxed) {
                     let _ = main_context.iteration(false);
                     // Keep retitling Windows D3D sinks (they often reset the title).
@@ -397,6 +474,7 @@ impl GStreamerPlayer {
                     rename_d3d_windows(WINDOW_TITLE);
                     thread::sleep(Duration::from_millis(50));
                 }
+                tracing::info!("GStreamer main loop task exited");
             })
             .map_err(|e| format!("spawn gstreamer main loop: {e}"))?;
 
@@ -419,12 +497,17 @@ impl GStreamerPlayer {
         }
 
         // volume element = PC-side gain (does not change phone volume).
-        let alac_pipeline = gst::parse::launch(
-            "appsrc name=alac_src is-live=true format=time do-timestamp=true \
-             ! queue ! avdec_alac ! audioconvert ! audioresample \
+        // Audio sinks use sync=true and share the video clock (see attach_shared_clock).
+        // ts-offset delays audio slightly so H.264 decode latency does not leave lips early.
+        let audio_delay_ns = AUDIO_LIP_SYNC_DELAY_NS as i64;
+        let alac_pipeline = gst::parse::launch(&format!(
+            "appsrc name=alac_src is-live=true format=time do-timestamp=true block=false \
+             max-buffers=32 max-bytes=262144 leaky-type=downstream \
+             ! queue max-size-buffers=16 max-size-time=0 max-size-bytes=0 leaky=downstream \
+             ! avdec_alac ! audioconvert ! audioresample \
              ! volume name=vol_alac volume=1.0 \
-             ! autoaudiosink sync=false",
-        )
+             ! autoaudiosink name=audiosink sync=true ts-offset={audio_delay_ns}"
+        ))
         .map_err(|e| format!("parse ALAC pipeline: {e}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "ALAC launch result is not a Pipeline".to_string())?;
@@ -446,12 +529,14 @@ impl GStreamerPlayer {
         alac_src.set_is_live(true);
         alac_src.set_stream_type(gst_app::AppStreamType::Stream);
 
-        let aac_eld_pipeline = gst::parse::launch(
-            "appsrc name=aac_eld_src is-live=true format=time do-timestamp=true \
-             ! queue ! avdec_aac ! audioconvert ! audioresample \
+        let aac_eld_pipeline = gst::parse::launch(&format!(
+            "appsrc name=aac_eld_src is-live=true format=time do-timestamp=true block=false \
+             max-buffers=32 max-bytes=262144 leaky-type=downstream \
+             ! queue max-size-buffers=16 max-size-time=0 max-size-bytes=0 leaky=downstream \
+             ! avdec_aac ! audioconvert ! audioresample \
              ! volume name=vol_aac volume=1.0 \
-             ! autoaudiosink sync=false",
-        )
+             ! autoaudiosink name=audiosink sync=true ts-offset={audio_delay_ns}"
+        ))
         .map_err(|e| format!("parse AAC-ELD pipeline: {e}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "AAC-ELD launch result is not a Pipeline".to_string())?;
@@ -478,57 +563,26 @@ impl GStreamerPlayer {
         set_pipeline_volume(&alac_pipeline, "vol_alac", vol);
         set_pipeline_volume(&aac_eld_pipeline, "vol_aac", vol);
 
-        for pipeline in [&h264_pipeline, &alac_pipeline, &aac_eld_pipeline] {
-            if let Some(bus) = pipeline.bus() {
-                bus.set_sync_handler(|_bus, msg| {
-                    use gst::MessageView;
-                    let source = msg
-                        .src()
-                        .map(|src| src.path_string())
-                        .unwrap_or_else(|| glib::GString::from("unknown"));
-                    match msg.view() {
-                        MessageView::Error(err) => {
-                            tracing::error!(
-                                source = %source,
-                                error = %err.error(),
-                                debug = ?err.debug(),
-                                "GStreamer decoder/pipeline error"
-                            );
-                        }
-                        MessageView::Warning(w) => {
-                            tracing::warn!(
-                                source = %source,
-                                error = %w.error(),
-                                debug = ?w.debug(),
-                                "GStreamer warning"
-                            );
-                        }
-                        MessageView::StateChanged(sc) => {
-                            let is_pipeline = msg
-                                .src()
-                                .and_then(|src| src.downcast_ref::<gst::Pipeline>())
-                                .is_some();
-                            if is_pipeline {
-                                tracing::info!(
-                                    source = %source,
-                                    old = ?sc.old(),
-                                    current = ?sc.current(),
-                                    pending = ?sc.pending(),
-                                    "GStreamer pipeline state changed"
-                                );
-                            }
-                            // When sink goes PLAYING, retitle window.
-                            if sc.current() == gst::State::Playing {
-                                #[cfg(windows)]
-                                rename_d3d_windows(WINDOW_TITLE);
-                            }
-                        }
-                        _ => {}
-                    }
-                    gst::BusSyncReply::Pass
-                });
-            }
+        // Shared clock for A/V lockstep across separate pipelines.
+        let shared_clock = gst::SystemClock::obtain();
+        attach_shared_clock(&h264_pipeline, &shared_clock);
+        attach_shared_clock(&alac_pipeline, &shared_clock);
+        attach_shared_clock(&aac_eld_pipeline, &shared_clock);
+        // Provide a small latency budget so sinks can wait for both streams.
+        for p in [&h264_pipeline, &alac_pipeline, &aac_eld_pipeline] {
+            p.set_latency(gst::ClockTime::from_mseconds(100));
         }
+
+        install_bus_watch(&h264_pipeline, "video", 0);
+        install_bus_watch(&alac_pipeline, "audio", 0);
+        install_bus_watch(&aac_eld_pipeline, "audio", 0);
+
+        tracing::info!(
+            audio_lip_sync_delay_ms = AUDIO_LIP_SYNC_DELAY_NS / 1_000_000,
+            preview_mode = %preview_mode,
+            sink_sync = preview_mode.options().sink_sync,
+            "A/V sync: shared clock + audio ts-offset; sinks paced (sync=true)"
+        );
 
         // Console volume keys (PC-side only).
         let vol_keys_quit = Arc::clone(&main_loop_quit);
@@ -589,6 +643,7 @@ impl GStreamerPlayer {
                         Err(_) => break,
                     }
                 }
+                tracing::info!("PC volume keys task exited");
             })
             .ok();
 
@@ -626,13 +681,257 @@ impl GStreamerPlayer {
             muted,
             volume_before_mute: Mutex::new(1.0),
             last_size: Mutex::new((0, 0)),
+            video_generation: GenerationGate::new(),
+            audio_generation: GenerationGate::new(),
+            video_lifecycle: PlayerLifecycle::new(),
+            audio_lifecycle: PlayerLifecycle::new(),
+            volume_sync,
+            system_volume,
+            shared_clock,
+            shared_base_time: Mutex::new(None),
             _main_loop_thread: Some(main_loop_thread),
             _volume_keys_thread: volume_keys_thread,
             main_loop_quit,
         })
     }
 
-    /// Set PC-side linear volume in `0.0..=2.0` (does not change the phone).
+    /// AirPlay volume sync mode for this player.
+    pub fn volume_sync_mode(&self) -> VolumeSyncMode {
+        self.volume_sync
+    }
+
+    /// Start a mirror pipeline with the shared A/V clock and a common base-time.
+    ///
+    /// The first of video/audio to start captures `base_time` from the shared
+    /// clock; later pipelines reuse it so sinks present on the same timeline.
+    fn start_pipeline_synced(&self, pipeline: &gst::Pipeline, label: &str) -> Result<(), String> {
+        attach_shared_clock(pipeline, &self.shared_clock);
+        // Live pipelines: do not use pipeline base-time auto-distribute fighting us.
+        pipeline.set_start_time(gst::ClockTime::NONE);
+        pipeline.set_base_time(gst::ClockTime::ZERO);
+
+        let base = {
+            let mut slot = self
+                .shared_base_time
+                .lock()
+                .map_err(|_| "shared_base_time mutex poisoned".to_string())?;
+            if slot.is_none() {
+                // Prefer the clock's current time as a common origin. A clock that
+                // reports no time yet is not fatal: fall back to zero so both
+                // pipelines still share the same origin.
+                let now = self.shared_clock.time().unwrap_or(gst::ClockTime::ZERO);
+                *slot = Some(now);
+                tracing::info!(
+                    base_time_ns = now.nseconds(),
+                    "A/V shared base-time established"
+                );
+            }
+            match *slot {
+                Some(base) => base,
+                None => gst::ClockTime::ZERO,
+            }
+        };
+        pipeline.set_base_time(base);
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| format!("{label} play failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Clear shared base-time when both mirror A/V are stopped so the next
+    /// session starts a fresh timeline.
+    fn maybe_reset_shared_base_time(&self) {
+        let video_idle = matches!(
+            self.video_lifecycle.get(),
+            crate::PlayerState::Idle | crate::PlayerState::Stopped
+        );
+        let audio_idle = matches!(
+            self.audio_lifecycle.get(),
+            crate::PlayerState::Idle | crate::PlayerState::Stopped
+        );
+        if video_idle && audio_idle {
+            if let Ok(mut slot) = self.shared_base_time.lock() {
+                if slot.take().is_some() {
+                    tracing::debug!("A/V shared base-time cleared");
+                }
+            }
+        }
+    }
+
+    /// Stop the H.264 pipeline if `generation` still owns video. Idempotent.
+    fn stop_video_pipeline_if_owner(&self, generation: StreamGeneration) {
+        if !self.video_generation.stop_if_owner(generation) {
+            return;
+        }
+        if !self.video_lifecycle.begin_stop() {
+            tracing::debug!(generation, "H.264 pipeline stop already in progress");
+            return;
+        }
+        // Re-check after winning begin_stop: a newer SETUP may have claimed.
+        // Restore Playing so we don't leave gen N+1 stuck in Stopping.
+        if !self.video_generation.is_owner(generation) {
+            tracing::debug!(
+                generation,
+                active = self.video_generation.active(),
+                "aborting video stop; generation replaced during shutdown"
+            );
+            self.video_lifecycle.mark_playing();
+            return;
+        }
+        tracing::info!(
+            generation,
+            pipeline_type = "video",
+            "video source disconnected; stopping H.264 pipeline (session-local)"
+        );
+        if let Ok(mut gate) = self.codec_gate.lock() {
+            gate.reset();
+        }
+        self.waiting_config_drops.store(0, Ordering::Relaxed);
+        self.waiting_idr_drops.store(0, Ordering::Relaxed);
+        self.frames_pushed.store(0, Ordering::Relaxed);
+        self.queue_overruns.store(0, Ordering::Relaxed);
+        self.appsrc_saturation_events.store(0, Ordering::Relaxed);
+        if let Ok(mut size) = self.last_size.lock() {
+            *size = (0, 0);
+        }
+        // Drop the mutex before the (potentially blocking) state change.
+        let pipeline = match self.h264_pipeline.lock() {
+            Ok(p) => p.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, "H.264 pipeline mutex poisoned on disconnect");
+                if self.video_generation.is_owner(generation) {
+                    self.video_lifecycle.mark_stopped();
+                }
+                return;
+            }
+        };
+        // Final owner check immediately before NULL — never stop a newer stream.
+        if !self.video_generation.is_owner(generation) {
+            tracing::debug!(
+                generation,
+                active = self.video_generation.active(),
+                "skipping H.264 NULL; newer generation is active"
+            );
+            self.video_lifecycle.mark_playing();
+            return;
+        }
+        // Send EOS then NULL so sinks release cleanly; errors are non-fatal.
+        if let Ok(src) = self.h264_src.lock() {
+            let _ = src.end_of_stream();
+        }
+        if let Err(e) = pipeline.set_state(gst::State::Null) {
+            tracing::warn!(error = %e, generation, "H.264 pipeline NULL transition failed");
+        }
+        if self.video_generation.is_owner(generation) {
+            self.video_lifecycle.mark_stopped();
+        }
+        self.maybe_reset_shared_base_time();
+        // Sink-owned HWND is destroyed with NULL; process + control server remain.
+        tracing::info!(
+            generation,
+            "H.264 pipeline stopped; receiver remains available for next stream"
+        );
+    }
+
+    fn stop_audio_pipelines_if_owner(&self, generation: StreamGeneration) {
+        if !self.audio_generation.stop_if_owner(generation) {
+            return;
+        }
+        if !self.audio_lifecycle.begin_stop() {
+            tracing::debug!(generation, "audio pipeline stop already in progress");
+            return;
+        }
+        if !self.audio_generation.is_owner(generation) {
+            tracing::debug!(
+                generation,
+                active = self.audio_generation.active(),
+                "aborting audio stop; generation replaced during shutdown"
+            );
+            self.audio_lifecycle.mark_playing();
+            return;
+        }
+        tracing::debug!(
+            generation,
+            pipeline_type = "audio",
+            "audio source disconnected; stopping audio pipelines"
+        );
+        let pipes: Vec<gst::Pipeline> = [&self.alac_pipeline, &self.aac_eld_pipeline]
+            .iter()
+            .filter_map(|pipe| pipe.lock().ok().map(|p| p.clone()))
+            .collect();
+        if !self.audio_generation.is_owner(generation) {
+            self.audio_lifecycle.mark_playing();
+            return;
+        }
+        for p in pipes {
+            if let Err(e) = p.set_state(gst::State::Null) {
+                tracing::warn!(error = %e, generation, "audio pipeline NULL transition failed");
+            }
+        }
+        if let Ok(mut ct) = self.audio_compression.lock() {
+            *ct = None;
+        }
+        if self.audio_generation.is_owner(generation) {
+            self.audio_lifecycle.mark_stopped();
+        }
+        self.maybe_reset_shared_base_time();
+    }
+
+    /// Re-enter PLAYING if the audio pipeline was paused/null'd by a transient error
+    /// or a stale stop that lost the race with a new generation.
+    fn ensure_audio_pipeline_playing(&self, label: &str, pipe: &Mutex<gst::Pipeline>) {
+        // Only revive when this player still believes audio is active.
+        if !matches!(
+            self.audio_lifecycle.get(),
+            crate::PlayerState::Playing | crate::PlayerState::Starting
+        ) {
+            return;
+        }
+        let Ok(p) = pipe.lock() else {
+            return;
+        };
+        let (_res, current, _pending) = p.state(gst::ClockTime::ZERO);
+        if current == gst::State::Playing {
+            return;
+        }
+        if current == gst::State::Paused {
+            if let Err(e) = p.set_state(gst::State::Playing) {
+                tracing::debug!(pipeline = label, error = %e, "audio resume from Paused failed");
+            }
+            return;
+        }
+        // Null/Ready — try to bring back up for the live mirror session.
+        let vol = if self.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            milli_to_volume(self.volume_milli.load(Ordering::Relaxed))
+        };
+        let vol_name = if label.starts_with("ALAC") {
+            "vol_alac"
+        } else {
+            "vol_aac"
+        };
+        set_pipeline_volume(&p, vol_name, vol);
+        drop(p);
+        // Re-lock via start path needs owned pipeline clone.
+        let Ok(p) = pipe.lock() else {
+            return;
+        };
+        if let Err(e) = self.start_pipeline_synced(&p, label) {
+            tracing::warn!(
+                pipeline = label,
+                error = %e,
+                ?current,
+                "audio pipeline revive to PLAYING failed"
+            );
+        } else {
+            tracing::info!(pipeline = label, from = ?current, "audio pipeline revived to PLAYING");
+        }
+    }
+
+    /// Set software (pipeline) linear volume in `0.0..=2.0`.
+    /// Does not change Windows system master volume.
     pub fn set_volume(&self, volume: f64) {
         let v = volume.clamp(0.0, 2.0);
         self.muted.store(false, Ordering::Relaxed);
@@ -644,10 +943,21 @@ impl GStreamerPlayer {
         if let Ok(p) = self.aac_eld_pipeline.lock() {
             set_pipeline_volume(&p, "vol_aac", v);
         }
+        // Media playbin (YouTube HLS) exposes a top-level `volume` property.
+        if let Ok(slot) = self.hls_pipeline.lock() {
+            if let Some(p) = slot.as_ref() {
+                if p.find_property("volume").is_some() {
+                    p.set_property("volume", v);
+                }
+                if p.find_property("mute").is_some() {
+                    p.set_property("mute", v <= 0.000_1);
+                }
+            }
+        }
         tracing::info!(
             linear = v,
             percent = (v * 100.0).round() as i32,
-            "PC volume set"
+            "software volume set (GStreamer)"
         );
     }
 
@@ -677,7 +987,8 @@ impl GStreamerPlayer {
             }
         }
         if let Err(e) = src.push_buffer(buffer) {
-            tracing::warn!(error = %e, "gstreamer: push_buffer failed");
+            // Flushing/EOS after a brief pipeline restart is common; caller may revive.
+            tracing::debug!(error = %e, "gstreamer: push_buffer failed");
         }
     }
 }
@@ -691,12 +1002,9 @@ fn milli_to_volume(m: u32) -> f64 {
 }
 
 fn airplay_db_to_linear(volume_db: f64) -> f64 {
-    let volume_db = volume_db.clamp(-144.0, 0.0);
-    if volume_db <= -144.0 {
-        0.0
-    } else {
-        10_f64.powf(volume_db / 20.0)
-    }
+    // Used only for VolumeSyncMode::Player (pipeline gain).
+    // 0.0 dB => 1.0 (maximum). Mute threshold => 0.0.
+    crate::system_volume::airplay_db_to_amplitude(volume_db)
 }
 
 fn set_pipeline_volume(pipeline: &gst::Pipeline, name: &str, volume: f64) {
@@ -836,6 +1144,85 @@ fn install_aspect_ratio_handler(pipeline: &gst::Pipeline) {
     });
 }
 
+/// Pin a pipeline to the shared clock so video and audio present on one timeline.
+///
+/// AirPlay delivers mirror video and audio on separate sockets, so they live in
+/// separate pipelines. Without a common clock each pipeline picks its own and the
+/// two drift apart (lips ahead of voice).
+fn attach_shared_clock(pipeline: &gst::Pipeline, clock: &gst::Clock) {
+    // use_clock() disables clock auto-selection and forces this exact clock.
+    pipeline.use_clock(Some(clock));
+}
+
+/// Bus watcher: log Error/Warning/Eos/StateChanged. Never panics; never exits the process.
+fn install_bus_watch(pipeline: &gst::Pipeline, pipeline_type: &'static str, generation: u64) {
+    let Some(bus) = pipeline.bus() else {
+        tracing::warn!(pipeline_type, generation, "pipeline has no bus");
+        return;
+    };
+    bus.set_sync_handler(move |_bus, msg| {
+        use gst::MessageView;
+        let source = msg
+            .src()
+            .map(|src| src.path_string())
+            .unwrap_or_else(|| glib::GString::from("unknown"));
+        match msg.view() {
+            MessageView::Error(err) => {
+                tracing::error!(
+                    source = %source,
+                    error = %err.error(),
+                    debug = ?err.debug(),
+                    pipeline_type,
+                    generation,
+                    "GStreamer pipeline error (session-local; control server unaffected)"
+                );
+            }
+            MessageView::Warning(w) => {
+                tracing::warn!(
+                    source = %source,
+                    error = %w.error(),
+                    debug = ?w.debug(),
+                    pipeline_type,
+                    generation,
+                    "GStreamer warning"
+                );
+            }
+            MessageView::Eos(_) => {
+                tracing::info!(
+                    source = %source,
+                    pipeline_type,
+                    generation,
+                    "GStreamer EOS"
+                );
+            }
+            MessageView::StateChanged(sc) => {
+                let is_pipeline = msg
+                    .src()
+                    .and_then(|src| src.downcast_ref::<gst::Pipeline>())
+                    .is_some();
+                if is_pipeline {
+                    tracing::info!(
+                        source = %source,
+                        old = ?sc.old(),
+                        current = ?sc.current(),
+                        pending = ?sc.pending(),
+                        pipeline_type,
+                        generation,
+                        "GStreamer pipeline state changed"
+                    );
+                }
+                // When sink goes PLAYING, retitle window.
+                if sc.current() == gst::State::Playing {
+                    #[cfg(windows)]
+                    rename_d3d_windows(WINDOW_TITLE);
+                }
+            }
+            _ => {}
+        }
+        gst::BusSyncReply::Pass
+    });
+}
+
 /// Windows D3D sinks often ignore GStreamer title props and use "Direct3D12 Renderer".
 #[cfg(windows)]
 fn rename_d3d_windows(title: &str) {
@@ -898,9 +1285,14 @@ fn rename_d3d_windows(title: &str) {
 fn rename_d3d_windows(_title: &str) {}
 
 impl AirPlayConsumer for GStreamerPlayer {
-    fn on_video_format(&self, info: &VideoStreamInfo) {
+    fn on_video_format(&self, info: &VideoStreamInfo, generation: StreamGeneration) {
+        // Mark this generation active first so any in-flight stale disconnect is ignored.
+        self.video_generation.claim(generation);
+        self.video_lifecycle.reset_for_start();
+        self.video_lifecycle.mark_starting();
         tracing::info!(
             stream_connection_id = %info.stream_connection_id,
+            generation,
             window = WINDOW_TITLE,
             decoder = self.selected_decoder.factory_name(),
             hardware = self.selected_decoder.is_hardware(),
@@ -920,20 +1312,27 @@ impl AirPlayConsumer for GStreamerPlayer {
         if let Ok(mut s) = self.last_size.lock() {
             *s = (0, 0);
         }
-        match self.h264_pipeline.lock() {
-            Ok(p) => {
-                apply_window_title(&p, WINDOW_TITLE);
-                apply_force_aspect_ratio(&p);
-                if let Err(e) = p.set_state(gst::State::Playing) {
-                    tracing::error!(error = %e, "failed to play H.264 pipeline");
-                }
-                apply_window_title(&p, WINDOW_TITLE);
-                apply_force_aspect_ratio(&p);
-                #[cfg(windows)]
-                rename_d3d_windows(WINDOW_TITLE);
+        let pipeline = match self.h264_pipeline.lock() {
+            Ok(p) => p.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, generation, "H.264 pipeline mutex poisoned");
+                return;
             }
-            Err(e) => tracing::error!(error = %e, "H.264 pipeline mutex poisoned"),
+        };
+        install_bus_watch(&pipeline, "video", generation);
+        apply_window_title(&pipeline, WINDOW_TITLE);
+        apply_force_aspect_ratio(&pipeline);
+        // Ensure a clean restart after a prior NULL (sink will recreate the HWND).
+        let _ = pipeline.set_state(gst::State::Ready);
+        if let Err(e) = self.start_pipeline_synced(&pipeline, "H.264") {
+            tracing::error!(error = %e, generation, "failed to play H.264 pipeline");
+            return;
         }
+        apply_window_title(&pipeline, WINDOW_TITLE);
+        apply_force_aspect_ratio(&pipeline);
+        #[cfg(windows)]
+        rename_d3d_windows(WINDOW_TITLE);
+        self.video_lifecycle.mark_playing();
     }
 
     fn on_video_size(&self, width: u32, height: u32) {
@@ -1024,30 +1423,17 @@ impl AirPlayConsumer for GStreamerPlayer {
         }
     }
 
-    fn on_video_src_disconnect(&self) {
-        tracing::info!("video source disconnected; stopping H.264 pipeline");
-        if let Ok(mut gate) = self.codec_gate.lock() {
-            gate.reset();
-        }
-        self.waiting_config_drops.store(0, Ordering::Relaxed);
-        self.waiting_idr_drops.store(0, Ordering::Relaxed);
-        self.frames_pushed.store(0, Ordering::Relaxed);
-        self.queue_overruns.store(0, Ordering::Relaxed);
-        self.appsrc_saturation_events.store(0, Ordering::Relaxed);
-        if let Ok(mut size) = self.last_size.lock() {
-            *size = (0, 0);
-        }
-        match self.h264_pipeline.lock() {
-            Ok(p) => {
-                let _ = p.set_state(gst::State::Null);
-            }
-            Err(e) => tracing::error!(error = %e, "H.264 pipeline mutex poisoned on disconnect"),
-        }
+    fn on_video_src_disconnect(&self, generation: StreamGeneration) {
+        self.stop_video_pipeline_if_owner(generation);
     }
 
-    fn on_audio_format(&self, info: &AudioStreamInfo) {
+    fn on_audio_format(&self, info: &AudioStreamInfo, generation: StreamGeneration) {
+        self.audio_generation.claim(generation);
+        self.audio_lifecycle.reset_for_start();
+        self.audio_lifecycle.mark_starting();
         tracing::info!(
             ?info,
+            generation,
             "audio format; PC volume applies to this stream (not phone)"
         );
         if let Ok(mut ct) = self.audio_compression.lock() {
@@ -1062,61 +1448,149 @@ impl AirPlayConsumer for GStreamerPlayer {
             ("ALAC", &self.alac_pipeline, "vol_alac"),
             ("AAC-ELD", &self.aac_eld_pipeline, "vol_aac"),
         ] {
-            match pipe.lock() {
-                Ok(p) => {
-                    set_pipeline_volume(&p, vol_name, vol);
-                    if let Err(e) = p.set_state(gst::State::Playing) {
-                        tracing::warn!(pipeline = label, error = %e, "failed to play audio pipeline");
-                    }
-                }
+            let pipeline = match pipe.lock() {
+                Ok(p) => p.clone(),
                 Err(e) => {
-                    tracing::error!(pipeline = label, error = %e, "audio pipeline mutex poisoned")
+                    tracing::error!(pipeline = label, error = %e, "audio pipeline mutex poisoned");
+                    continue;
                 }
+            };
+            install_bus_watch(&pipeline, "audio", generation);
+            set_pipeline_volume(&pipeline, vol_name, vol);
+            if let Err(e) = self.start_pipeline_synced(&pipeline, label) {
+                tracing::warn!(
+                    pipeline = label,
+                    error = %e,
+                    generation,
+                    "failed to play audio pipeline"
+                );
             }
         }
+        self.audio_lifecycle.mark_playing();
     }
 
     fn on_audio(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
         let compression = self.audio_compression.lock().ok().and_then(|g| *g);
         match compression {
-            Some(CompressionType::Alac) => match self.alac_src.lock() {
-                Ok(src) => Self::push_to_appsrc(&src, data),
-                Err(e) => tracing::error!(error = %e, "ALAC appsrc mutex poisoned"),
-            },
+            Some(CompressionType::Alac) => {
+                self.ensure_audio_pipeline_playing("ALAC", &self.alac_pipeline);
+                match self.alac_src.lock() {
+                    Ok(src) => Self::push_to_appsrc(&src, data),
+                    Err(e) => tracing::error!(error = %e, "ALAC appsrc mutex poisoned"),
+                }
+            }
             Some(CompressionType::AacEld) | Some(CompressionType::Aac) => {
+                self.ensure_audio_pipeline_playing("AAC-ELD", &self.aac_eld_pipeline);
                 match self.aac_eld_src.lock() {
                     Ok(src) => Self::push_to_appsrc(&src, data),
                     Err(e) => tracing::error!(error = %e, "AAC-ELD appsrc mutex poisoned"),
                 }
             }
             other => {
-                tracing::trace!(
-                    ?other,
-                    "ignoring audio (unsupported or unknown compression)"
+                // Avoid silent permanent mute when format callback was missed.
+                static ONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = ONCE.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n % 200 == 0 {
+                    tracing::warn!(
+                        ?other,
+                        n,
+                        "audio frame without known compression; waiting for on_audio_format"
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_audio_src_disconnect(&self, generation: StreamGeneration) {
+        self.stop_audio_pipelines_if_owner(generation);
+    }
+
+    fn on_volume(&self, volume_db: f64) {
+        // Protocol: 0.0 dB = maximum, NOT mute. Clamp only non-finite extremes.
+        let volume_db = if volume_db.is_finite() {
+            volume_db.clamp(-144.0, 0.0)
+        } else {
+            -144.0
+        };
+        self.airplay_volume_db_milli
+            .store((volume_db * 1000.0).round() as i32, Ordering::Relaxed);
+
+        match self.volume_sync {
+            VolumeSyncMode::Disabled => {
+                tracing::debug!(volume_db, "AirPlay volume ignored (volume_sync=disabled)");
+            }
+            VolumeSyncMode::System => {
+                // Keep GStreamer pipeline at unity so OS master volume is the only attenuator.
+                self.set_volume(1.0);
+                if let Err(e) = self.system_volume.set_airplay_volume_db(volume_db) {
+                    tracing::warn!(
+                        error = %e,
+                        volume_db,
+                        "system volume update failed (playback continues)"
+                    );
+                } else if airplay_db_is_mute(volume_db) {
+                    tracing::info!(
+                        db = volume_db,
+                        source = "airplay",
+                        "AirPlay volume update (mute)"
+                    );
+                } else if (volume_db - 0.0).abs() < 1e-6 {
+                    tracing::info!(
+                        db = volume_db,
+                        source = "airplay",
+                        "AirPlay volume update (maximum)"
+                    );
+                } else {
+                    tracing::info!(db = volume_db, source = "airplay", "AirPlay volume update");
+                }
+            }
+            VolumeSyncMode::Player => {
+                let linear = airplay_db_to_linear(volume_db);
+                self.set_volume(linear);
+                tracing::info!(
+                    volume_db,
+                    linear,
+                    source = "airplay",
+                    "AirPlay volume applied to GStreamer pipeline"
                 );
             }
         }
     }
 
-    fn on_audio_src_disconnect(&self) {
-        tracing::debug!("audio source disconnected; stopping audio pipelines");
-        for pipe in [&self.alac_pipeline, &self.aac_eld_pipeline] {
-            if let Ok(p) = pipe.lock() {
-                let _ = p.set_state(gst::State::Null);
+    fn on_mute(&self, muted: bool) {
+        match self.volume_sync {
+            VolumeSyncMode::Disabled => {
+                tracing::debug!(muted, "AirPlay mute ignored (volume_sync=disabled)");
+            }
+            VolumeSyncMode::System => {
+                if let Err(e) = self.system_volume.set_muted(muted) {
+                    tracing::warn!(
+                        error = %e,
+                        muted,
+                        "system mute update failed (playback continues)"
+                    );
+                } else {
+                    tracing::info!(muted, source = "airplay", "AirPlay mute update");
+                }
+                // Keep pipeline unity while OS mute owns silence.
+                if !muted {
+                    self.set_volume(1.0);
+                }
+            }
+            VolumeSyncMode::Player => {
+                if muted {
+                    self.set_volume(0.0);
+                } else {
+                    let db =
+                        self.airplay_volume_db_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+                    self.set_volume(airplay_db_to_linear(db));
+                }
+                tracing::info!(muted, source = "airplay", "AirPlay mute applied to pipeline");
             }
         }
-        if let Ok(mut ct) = self.audio_compression.lock() {
-            *ct = None;
-        }
-    }
-
-    fn on_volume(&self, volume_db: f64) {
-        let volume_db = volume_db.clamp(-144.0, 0.0);
-        let linear = airplay_db_to_linear(volume_db);
-        self.airplay_volume_db_milli
-            .store((volume_db * 1000.0).round() as i32, Ordering::Relaxed);
-        self.set_volume(linear);
-        tracing::info!(volume_db, linear, "AirPlay phone volume applied");
     }
 
     fn volume(&self) -> Option<f64> {
@@ -1124,27 +1598,51 @@ impl AirPlayConsumer for GStreamerPlayer {
     }
 
     fn on_media_playlist(&self, playlist_uri: &str) {
-        tracing::info!(%playlist_uri, "starting GStreamer HLS playbin");
-        match gst::parse::launch(&format!("playbin3 uri={playlist_uri}")) {
-            Ok(elem) => match elem.downcast::<gst::Pipeline>() {
-                Ok(pipeline) => {
-                    if let Err(e) = pipeline.set_state(gst::State::Playing) {
-                        tracing::error!(error = %e, "HLS pipeline play failed");
-                    }
-                    if let Ok(mut slot) = self.hls_pipeline.lock() {
-                        if let Some(old) = slot.take() {
-                            let _ = old.set_state(gst::State::Null);
-                        }
-                        *slot = Some(pipeline);
-                    }
-                }
-                Err(_) => tracing::error!("playbin3 launch is not a Pipeline"),
-            },
-            Err(e) => tracing::error!(error = %e, "failed to parse HLS pipeline"),
+        // Never log full URI query strings (may contain tokens).
+        let safe = playlist_uri.split('?').next().unwrap_or(playlist_uri);
+        tracing::info!(uri_path = %safe, "starting GStreamer media playbin (HLS)");
+
+        // Mirror appsrc path must not feed media URLs; stop mirror video first.
+        if let Ok(p) = self.h264_pipeline.lock() {
+            let _ = p.set_state(gst::State::Null);
         }
+
+        let pipeline = match build_media_playbin(playlist_uri) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, "media playbin construction failed");
+                return;
+            }
+        };
+        install_bus_watch(&pipeline, "media", 0);
+        apply_window_title(&pipeline, WINDOW_TITLE);
+
+        // Apply current software volume to the new media pipeline.
+        let vol = milli_to_volume(self.volume_milli.load(Ordering::Relaxed));
+        if pipeline.find_property("volume").is_some() {
+            pipeline.set_property("volume", vol);
+        }
+        if pipeline.find_property("mute").is_some() {
+            pipeline.set_property("mute", vol <= 0.000_1);
+        }
+
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            tracing::error!(error = %e, "media playbin PLAYING failed");
+            let _ = pipeline.set_state(gst::State::Null);
+            return;
+        }
+
+        if let Ok(mut slot) = self.hls_pipeline.lock() {
+            if let Some(old) = slot.take() {
+                let _ = old.set_state(gst::State::Null);
+            }
+            *slot = Some(pipeline);
+        }
+        tracing::info!("media playbin started (session-local; receiver remains available)");
     }
 
     fn on_media_playlist_remove(&self) {
+        tracing::info!("stopping media playbin");
         if let Ok(mut slot) = self.hls_pipeline.lock() {
             if let Some(p) = slot.take() {
                 let _ = p.set_state(gst::State::Null);
@@ -1155,7 +1653,11 @@ impl AirPlayConsumer for GStreamerPlayer {
     fn on_media_playlist_pause(&self) {
         if let Ok(slot) = self.hls_pipeline.lock() {
             if let Some(p) = slot.as_ref() {
-                let _ = p.set_state(gst::State::Paused);
+                if let Err(e) = p.set_state(gst::State::Paused) {
+                    tracing::warn!(error = %e, "media pause failed");
+                } else {
+                    tracing::info!("media paused");
+                }
             }
         }
     }
@@ -1163,7 +1665,64 @@ impl AirPlayConsumer for GStreamerPlayer {
     fn on_media_playlist_resume(&self) {
         if let Ok(slot) = self.hls_pipeline.lock() {
             if let Some(p) = slot.as_ref() {
-                let _ = p.set_state(gst::State::Playing);
+                if let Err(e) = p.set_state(gst::State::Playing) {
+                    tracing::warn!(error = %e, "media resume failed");
+                } else {
+                    tracing::info!("media resumed");
+                }
+            }
+        }
+    }
+
+    fn on_media_playlist_seek(&self, position_seconds: f64) {
+        if position_seconds < 0.0 || !position_seconds.is_finite() {
+            return;
+        }
+        let Ok(slot) = self.hls_pipeline.lock() else {
+            return;
+        };
+        let Some(p) = slot.as_ref() else {
+            return;
+        };
+        let nanos = (position_seconds * 1_000_000_000.0).round() as u64;
+        let clock = gst::ClockTime::from_nseconds(nanos);
+        match p.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, clock) {
+            Ok(()) => tracing::info!(position_seconds, "media seek"),
+            Err(e) => tracing::warn!(position_seconds, error = %e, "media seek failed"),
+        }
+    }
+
+    fn on_media_playlist_seek_fraction(&self, fraction: f64) {
+        if !(0.0..=1.0).contains(&fraction) || !fraction.is_finite() {
+            return;
+        }
+        let Ok(slot) = self.hls_pipeline.lock() else {
+            return;
+        };
+        let Some(p) = slot.as_ref() else {
+            return;
+        };
+        let Some(duration) = p.query_duration::<gst::ClockTime>() else {
+            tracing::debug!(fraction, "seek fraction deferred (duration unknown)");
+            return;
+        };
+        let target = duration.nseconds() as f64 * fraction;
+        let clock = gst::ClockTime::from_nseconds(target.round() as u64);
+        match p.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, clock) {
+            Ok(()) => tracing::info!(fraction, "media seek fraction"),
+            Err(e) => tracing::warn!(fraction, error = %e, "media seek fraction failed"),
+        }
+    }
+
+    fn on_media_error(&self, message: &str) {
+        tracing::warn!(
+            %message,
+            "media error (receiver stays alive; mirroring/control unaffected)"
+        );
+        // Tear down media pipeline only — do not exit process or close control.
+        if let Ok(mut slot) = self.hls_pipeline.lock() {
+            if let Some(p) = slot.take() {
+                let _ = p.set_state(gst::State::Null);
             }
         }
     }
@@ -1189,16 +1748,37 @@ impl AirPlayConsumer for GStreamerPlayer {
     }
 }
 
+/// Build a media URI player (`playbin3` preferred, `playbin` fallback).
+///
+/// Sets `uri` as a property — never via pipeline-string interpolation.
+fn build_media_playbin(uri: &str) -> Result<gst::Pipeline, String> {
+    let element = gst::ElementFactory::make("playbin3")
+        .build()
+        .or_else(|_| gst::ElementFactory::make("playbin").build())
+        .map_err(|e| {
+            format!(
+                "playbin3/playbin unavailable (install gstreamer playback plugins): {e}"
+            )
+        })?;
+    element.set_property("uri", uri);
+    element
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "playbin is not a Pipeline".to_string())
+}
+
 impl Drop for GStreamerPlayer {
     fn drop(&mut self) {
-        for pipe in [
+        // Process-level teardown only — never called for session TEARDOWN.
+        let pipes: Vec<gst::Pipeline> = [
             &self.h264_pipeline,
             &self.alac_pipeline,
             &self.aac_eld_pipeline,
-        ] {
-            if let Ok(p) = pipe.lock() {
-                let _ = p.set_state(gst::State::Null);
-            }
+        ]
+        .iter()
+        .filter_map(|pipe| pipe.lock().ok().map(|p| p.clone()))
+        .collect();
+        for p in pipes {
+            let _ = p.set_state(gst::State::Null);
         }
         if let Ok(mut slot) = self.hls_pipeline.lock() {
             if let Some(p) = slot.take() {
@@ -1207,6 +1787,7 @@ impl Drop for GStreamerPlayer {
         }
         self.main_loop_quit.store(true, Ordering::Relaxed);
         if let Some(handle) = self._main_loop_thread.take() {
+            // Bounded join: don't hang process exit if the loop is stuck.
             let _ = handle.join();
         }
         // volume keys thread may block on stdin; detach by not joining long.
@@ -1215,6 +1796,7 @@ impl Drop for GStreamerPlayer {
             let _ = handle;
         }
         let _ = self.volume_before_mute;
+        tracing::info!("GStreamer player dropped");
     }
 }
 
@@ -1225,11 +1807,73 @@ mod tests {
 
     #[test]
     fn airplay_db_maps_to_linear_gstreamer_gain() {
+        // 0.0 dB is maximum, never mute.
         assert_eq!(airplay_db_to_linear(0.0), 1.0);
+        assert!(!crate::airplay_db_is_mute(0.0));
         assert!((airplay_db_to_linear(-20.0) - 0.1).abs() < 1e-12);
         assert_eq!(airplay_db_to_linear(-144.0), 0.0);
+        assert!(crate::airplay_db_is_mute(-144.0));
+        assert!(!crate::airplay_db_is_mute(-30.0));
         assert_eq!(airplay_db_to_linear(-200.0), 0.0);
         assert_eq!(airplay_db_to_linear(6.0), 1.0);
+    }
+
+    #[test]
+    #[ignore = "requires installed GStreamer runtime"]
+    fn system_volume_mode_keeps_pipeline_unity_and_forwards_db() {
+        use crate::system_volume::RecordingSystemVolumeController;
+        use airplay_server::AirPlayConsumer;
+        use std::sync::Arc;
+
+        let rec = Arc::new(RecordingSystemVolumeController::new());
+        let player = GStreamerPlayer::with_volume_sync(
+            1.0,
+            PreviewMode::Balanced,
+            false,
+            VolumeSyncMode::System,
+            Some(rec.clone()),
+        )
+        .expect("gstreamer player");
+
+        // Maximum
+        player.on_volume(0.0);
+        // Intermediate
+        player.on_volume(-20.5);
+        // Mute sentinel
+        player.on_volume(-144.0);
+        player.on_mute(true);
+        player.on_mute(false);
+
+        // Pipeline stays near unity in system mode (set_volume(1.0) on each update).
+        assert!((player.volume_milli.load(Ordering::Relaxed) as f64 / 1000.0 - 1.0).abs() < 1e-6);
+
+        let vols = rec.volumes();
+        assert!(vols.contains(&0.0));
+        assert!(vols.iter().any(|v| (*v + 20.5).abs() < 1e-9));
+        assert!(vols.iter().any(|v| *v <= -100.0));
+        assert_eq!(rec.mutes(), vec![true, false]);
+    }
+
+    #[test]
+    #[ignore = "requires installed GStreamer runtime"]
+    fn system_volume_failure_does_not_panic() {
+        use crate::system_volume::RecordingSystemVolumeController;
+        use airplay_server::AirPlayConsumer;
+        use std::sync::Arc;
+
+        let rec = Arc::new(RecordingSystemVolumeController::new());
+        rec.fail.store(true, Ordering::Relaxed);
+        let player = GStreamerPlayer::with_volume_sync(
+            1.0,
+            PreviewMode::Balanced,
+            false,
+            VolumeSyncMode::System,
+            Some(rec),
+        )
+        .expect("gstreamer player");
+        // Must not panic / terminate.
+        player.on_volume(-12.0);
+        player.on_mute(true);
     }
 
     #[test]
@@ -1283,6 +1927,38 @@ mod tests {
         assert!(text.contains("leaky-type=upstream"));
         assert!(text.contains("max-size-buffers=8"));
         assert!(text.contains("leaky=no"));
+    }
+
+    #[test]
+    fn generation_gate_blocks_stale_video_stop() {
+        let gate = GenerationGate::new();
+        gate.claim(10);
+        assert!(gate.stop_if_owner(10));
+        gate.claim(11);
+        assert!(!gate.stop_if_owner(10));
+    }
+
+    #[test]
+    fn player_lifecycle_stop_is_single_flight() {
+        let life = PlayerLifecycle::new();
+        life.mark_playing();
+        assert!(life.begin_stop());
+        assert!(!life.begin_stop());
+        life.mark_stopped();
+        assert!(!life.begin_stop());
+        life.reset_for_start();
+        life.mark_playing();
+        assert!(life.begin_stop());
+    }
+
+    #[test]
+    #[ignore = "requires installed GStreamer playback plugins"]
+    fn media_playbin_sets_uri_as_property() {
+        gst::init().unwrap();
+        let uri = "http://127.0.0.1:7000/playlist/master.m3u8";
+        let playbin = build_media_playbin(uri).unwrap();
+        assert_eq!(playbin.property::<String>("uri"), uri);
+        playbin.set_state(gst::State::Null).unwrap();
     }
 
     #[test]

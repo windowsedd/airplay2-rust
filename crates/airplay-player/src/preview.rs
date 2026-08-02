@@ -22,10 +22,13 @@ impl PreviewMode {
                 queue_leaky: true,
                 sink_sync: true,
             },
+            // Keep sink_sync=true so video/audio share paced presentation.
+            // Latency comes from a small leaky queue, not freerunning video
+            // (which desyncs lips from audio on a separate pipeline).
             Self::LowLatency => PreviewOptions {
                 queue_max_buffers: 2,
                 queue_leaky: true,
-                sink_sync: false,
+                sink_sync: true,
             },
         }
     }
@@ -163,7 +166,7 @@ mod tests {
             PreviewOptions {
                 queue_max_buffers: 2,
                 queue_leaky: true,
-                sink_sync: false,
+                sink_sync: true,
             }
         );
     }

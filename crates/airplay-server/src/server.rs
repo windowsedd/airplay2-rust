@@ -10,8 +10,13 @@ use tracing::{error, info, warn};
 
 use crate::config::AirPlayConfig;
 use crate::consumer::AirPlayConsumer;
-use crate::control::{read_request, write_response, ControlHandler};
+use crate::control::{
+    read_request, read_response, write_response, ConnectionDirective, ControlHandler,
+    OutboundRequest,
+};
 use crate::session::SessionManager;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 
 /// AirPlay receiver: control server + mDNS advertisement.
 pub struct AirPlayServer {
@@ -58,6 +63,7 @@ impl AirPlayServer {
 
         let accept_task = tokio::spawn(async move {
             control_accept_loop(listener, sessions, config, consumer, port, shutdown_rx).await;
+            info!("control listener task exited");
         });
         self.accept_task = Some(accept_task);
 
@@ -117,10 +123,12 @@ async fn control_accept_loop(
     control_port: u16,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let exit_reason;
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
+                    exit_reason = "shutdown requested";
                     break;
                 }
             }
@@ -132,29 +140,38 @@ async fn control_accept_loop(
                         let config = config.clone();
                         let consumer = Arc::clone(&consumer);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(
+                            let result = handle_connection(
                                 stream,
                                 sessions,
                                 config,
                                 consumer,
                                 control_port,
                             )
-                            .await
-                            {
-                                debug_connection_err(e);
+                            .await;
+                            match result {
+                                Ok(()) => {
+                                    tracing::debug!(%peer, "control connection task exited normally");
+                                }
+                                Err(e) => {
+                                    debug_connection_err(e);
+                                    tracing::debug!(%peer, "control connection task exited with error");
+                                }
                             }
                         });
                     }
                     Err(e) => {
                         if *shutdown_rx.borrow() {
+                            exit_reason = "shutdown during accept error";
                             break;
                         }
                         error!("control accept error: {e}");
+                        // Keep listening — a single accept failure is not fatal.
                     }
                 }
             }
         }
     }
+    info!(reason = exit_reason, "control accept loop ending");
 }
 
 fn debug_connection_err(e: std::io::Error) {
@@ -173,7 +190,12 @@ async fn handle_connection(
     consumer: Arc<dyn AirPlayConsumer>,
     control_port: u16,
 ) -> std::io::Result<()> {
-    let handler = ControlHandler::new(sessions, config, consumer, control_port);
+    let handler = ControlHandler::new(
+        Arc::clone(&sessions),
+        config,
+        consumer,
+        control_port,
+    );
     let (mut reader, mut writer) = stream.into_split();
     let mut pending = Vec::new();
 
@@ -182,8 +204,109 @@ async fn handle_connection(
             Some(r) => r,
             None => break,
         };
-        let response = handler.handle(&req).await;
-        write_response(&mut writer, &response).await?;
+        let result = handler.handle(&req).await;
+        write_response(&mut writer, &result.response).await?;
+
+        if let ConnectionDirective::UpgradeReverse {
+            session_id,
+            purpose,
+        } = result.directive
+        {
+            return run_reverse_connection(
+                reader,
+                writer,
+                pending,
+                sessions,
+                session_id,
+                purpose,
+            )
+            .await;
+        }
     }
+    Ok(())
+}
+
+/// After HTTP 101, this connection becomes a reverse client channel.
+async fn run_reverse_connection(
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut pending: Vec<u8>,
+    sessions: Arc<SessionManager>,
+    session_id: String,
+    purpose: String,
+) -> std::io::Result<()> {
+    let (tx, mut rx) = mpsc::channel::<OutboundRequest>(8);
+    let generation = sessions.register_reverse(&session_id, &purpose, tx);
+    info!(
+        session = %session_id,
+        purpose = %purpose,
+        generation,
+        "reverse connection active"
+    );
+
+    let exit_reason;
+    loop {
+        tokio::select! {
+            outbound = rx.recv() => {
+                match outbound {
+                    Some(request) => {
+                        if let Err(e) = writer.write_all(&request.to_bytes()).await {
+                            exit_reason = "write failed";
+                            warn!(session = %session_id, error = %e, "reverse write failed");
+                            break;
+                        }
+                        if let Err(e) = writer.flush().await {
+                            exit_reason = "flush failed";
+                            warn!(session = %session_id, error = %e, "reverse flush failed");
+                            break;
+                        }
+                    }
+                    None => {
+                        exit_reason = "channel closed";
+                        break;
+                    }
+                }
+            }
+            response = read_response(&mut reader, &mut pending) => {
+                match response {
+                    Ok(Some(head)) => {
+                        tracing::debug!(
+                            session = %session_id,
+                            purpose = %purpose,
+                            status = head.status,
+                            body_len = head.body_len,
+                            "reverse response"
+                        );
+                    }
+                    Ok(None) => {
+                        exit_reason = "peer closed";
+                        break;
+                    }
+                    Err(e) => {
+                        exit_reason = "read error";
+                        match e.kind() {
+                            std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset => {}
+                            _ => warn!(
+                                session = %session_id,
+                                error = %e,
+                                "reverse read error"
+                            ),
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    sessions.remove_reverse_if_generation(&session_id, &purpose, generation);
+    info!(
+        session = %session_id,
+        purpose = %purpose,
+        generation,
+        reason = exit_reason,
+        "reverse connection task exited"
+    );
     Ok(())
 }

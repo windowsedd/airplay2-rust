@@ -78,6 +78,12 @@ impl ControlResponse {
         Self::new("HTTP/1.1", 200, "OK")
     }
 
+    pub fn switching_protocols(upgrade: &str) -> Self {
+        Self::new("HTTP/1.1", 101, "Switching Protocols")
+            .header("Upgrade", upgrade)
+            .header("Connection", "Upgrade")
+    }
+
     pub fn not_found(version: &str) -> Self {
         let v = if version.to_ascii_uppercase().starts_with("HTTP/") {
             "HTTP/1.1"
@@ -94,6 +100,18 @@ impl ControlResponse {
             "RTSP/1.0"
         };
         Self::new(v, 400, "Bad Request")
+    }
+
+    pub fn not_implemented_http() -> Self {
+        Self::new("HTTP/1.1", 501, "Not Implemented")
+    }
+
+    pub fn bad_gateway() -> Self {
+        Self::new("HTTP/1.1", 502, "Bad Gateway")
+    }
+
+    pub fn gateway_timeout() -> Self {
+        Self::new("HTTP/1.1", 504, "Gateway Timeout")
     }
 
     pub fn with_body(mut self, body: Vec<u8>) -> Self {
@@ -249,6 +267,144 @@ pub async fn write_response<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
+/// Outbound HTTP request sent on an upgraded reverse connection.
+#[derive(Debug, Clone)]
+pub struct OutboundRequest {
+    pub method: &'static str,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl OutboundRequest {
+    /// Java-compatible `POST /event` FCUP request.
+    pub fn post_event(session_id: &str, body: Vec<u8>) -> Self {
+        Self {
+            method: "POST",
+            path: "/event".into(),
+            headers: vec![
+                (
+                    "Content-Type".into(),
+                    "text/x-apple-plist+xml".into(),
+                ),
+                ("X-Apple-Session-ID".into(), session_id.to_string()),
+            ],
+            body,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256 + self.body.len());
+        out.extend_from_slice(
+            format!("{} {} HTTP/1.1\r\n", self.method, self.path).as_bytes(),
+        );
+        for (k, v) in &self.headers {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes(),
+        );
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+/// Minimal HTTP response head from a reverse connection (body discarded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlResponseHead {
+    pub status: u16,
+    pub reason: String,
+    pub body_len: usize,
+}
+
+/// Read one HTTP response from a reverse connection (keeps body out of logs).
+pub async fn read_response<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+) -> io::Result<Option<ControlResponseHead>> {
+    let mut tmp = [0u8; 2048];
+    let header_end = loop {
+        if let Some(pos) = find_header_end(pending) {
+            break pos;
+        }
+        if pending.len() >= MAX_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reverse response headers too large",
+            ));
+        }
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "eof before end of reverse response headers",
+            ));
+        }
+        pending.extend_from_slice(&tmp[..n]);
+    };
+
+    let header_bytes = pending[..header_end].to_vec();
+    let mut rest = pending.split_off(header_end + 4);
+    pending.clear();
+
+    let header_str = std::str::from_utf8(&header_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let mut parts = status_line.split_whitespace();
+    let _version = parts.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing response version")
+    })?;
+    let status: u16 = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing status"))?
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let reason = parts.collect::<Vec<_>>().join(" ");
+
+    let mut content_length = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("Content-Length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    if content_length > MAX_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reverse response body too large",
+        ));
+    }
+
+    while rest.len() < content_length {
+        let need = content_length - rest.len();
+        let mut chunk = vec![0u8; need.min(8192)];
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "eof before full reverse body",
+            ));
+        }
+        rest.extend_from_slice(&chunk[..n]);
+    }
+    // Discard body; keep pipelined bytes.
+    *pending = rest[content_length..].to_vec();
+
+    Ok(Some(ControlResponseHead {
+        status,
+        reason,
+        body_len: content_length,
+    }))
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
@@ -330,5 +486,38 @@ POST /pair-setup RTSP/1.0\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n";
         assert!(s.contains("CSeq: 1\r\n"));
         assert!(s.contains("Content-Length: 2\r\n"));
         assert!(bytes.ends_with(b"hi"));
+    }
+
+    #[test]
+    fn outbound_event_request_has_required_headers() {
+        let bytes = OutboundRequest::post_event("s1", b"<plist/>".to_vec()).to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("POST /event HTTP/1.1\r\n"));
+        assert!(text.contains("Content-Type: text/x-apple-plist+xml\r\n"));
+        assert!(text.contains("X-Apple-Session-ID: s1\r\n"));
+        assert!(text.contains("Content-Length: 8\r\n\r\n<plist/>"));
+    }
+
+    #[tokio::test]
+    async fn parses_reverse_http_response_and_preserves_next_frame() {
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        let mut reader = BufReader::new(Cursor::new(wire.as_slice()));
+        let mut pending = Vec::new();
+        assert_eq!(
+            read_response(&mut reader, &mut pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            read_response(&mut reader, &mut pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            204
+        );
     }
 }

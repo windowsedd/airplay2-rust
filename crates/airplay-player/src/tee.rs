@@ -4,7 +4,7 @@
 //! and/or GStreamer while also writing `dump.h264` for debugging.
 
 use airplay_lib::{AudioStreamInfo, VideoStreamInfo};
-use airplay_server::{AirPlayConsumer, PlaybackInfo};
+use airplay_server::{AirPlayConsumer, PlaybackInfo, StreamGeneration};
 
 /// Delivers each callback to every inner consumer (in order).
 pub struct TeePlayer {
@@ -18,9 +18,9 @@ impl TeePlayer {
 }
 
 impl AirPlayConsumer for TeePlayer {
-    fn on_video_format(&self, info: &VideoStreamInfo) {
+    fn on_video_format(&self, info: &VideoStreamInfo, generation: StreamGeneration) {
         for c in &self.inners {
-            c.on_video_format(info);
+            c.on_video_format(info, generation);
         }
     }
 
@@ -30,9 +30,9 @@ impl AirPlayConsumer for TeePlayer {
         }
     }
 
-    fn on_video_src_disconnect(&self) {
+    fn on_video_src_disconnect(&self, generation: StreamGeneration) {
         for c in &self.inners {
-            c.on_video_src_disconnect();
+            c.on_video_src_disconnect(generation);
         }
     }
 
@@ -42,9 +42,9 @@ impl AirPlayConsumer for TeePlayer {
         }
     }
 
-    fn on_audio_format(&self, info: &AudioStreamInfo) {
+    fn on_audio_format(&self, info: &AudioStreamInfo, generation: StreamGeneration) {
         for c in &self.inners {
-            c.on_audio_format(info);
+            c.on_audio_format(info, generation);
         }
     }
 
@@ -54,15 +54,21 @@ impl AirPlayConsumer for TeePlayer {
         }
     }
 
-    fn on_audio_src_disconnect(&self) {
+    fn on_audio_src_disconnect(&self, generation: StreamGeneration) {
         for c in &self.inners {
-            c.on_audio_src_disconnect();
+            c.on_audio_src_disconnect(generation);
         }
     }
 
     fn on_volume(&self, volume_db: f64) {
         for c in &self.inners {
             c.on_volume(volume_db);
+        }
+    }
+
+    fn on_mute(&self, muted: bool) {
+        for c in &self.inners {
+            c.on_mute(muted);
         }
     }
 
@@ -91,6 +97,24 @@ impl AirPlayConsumer for TeePlayer {
     fn on_media_playlist_resume(&self) {
         for c in &self.inners {
             c.on_media_playlist_resume();
+        }
+    }
+
+    fn on_media_playlist_seek(&self, position_seconds: f64) {
+        for c in &self.inners {
+            c.on_media_playlist_seek(position_seconds);
+        }
+    }
+
+    fn on_media_playlist_seek_fraction(&self, fraction: f64) {
+        for c in &self.inners {
+            c.on_media_playlist_seek_fraction(fraction);
+        }
+    }
+
+    fn on_media_error(&self, message: &str) {
+        for c in &self.inners {
+            c.on_media_error(message);
         }
     }
 

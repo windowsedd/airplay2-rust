@@ -10,29 +10,54 @@ use tokio::net::TcpStream;
 struct NoopConsumer;
 
 impl AirPlayConsumer for NoopConsumer {
-    fn on_video_format(&self, _info: &VideoStreamInfo) {}
+    fn on_video_format(
+        &self,
+        _info: &VideoStreamInfo,
+        _generation: airplay_server::StreamGeneration,
+    ) {
+    }
     fn on_video(&self, _data: &[u8]) {}
-    fn on_video_src_disconnect(&self) {}
-    fn on_audio_format(&self, _info: &AudioStreamInfo) {}
+    fn on_video_src_disconnect(&self, _generation: airplay_server::StreamGeneration) {}
+    fn on_audio_format(
+        &self,
+        _info: &AudioStreamInfo,
+        _generation: airplay_server::StreamGeneration,
+    ) {
+    }
     fn on_audio(&self, _data: &[u8]) {}
-    fn on_audio_src_disconnect(&self) {}
+    fn on_audio_src_disconnect(&self, _generation: airplay_server::StreamGeneration) {}
 }
 
 #[derive(Default)]
 struct RecordingVolumeConsumer {
     volume_db: Mutex<Option<f64>>,
+    muted: Mutex<Option<bool>>,
 }
 
 impl AirPlayConsumer for RecordingVolumeConsumer {
-    fn on_video_format(&self, _info: &VideoStreamInfo) {}
+    fn on_video_format(
+        &self,
+        _info: &VideoStreamInfo,
+        _generation: airplay_server::StreamGeneration,
+    ) {
+    }
     fn on_video(&self, _data: &[u8]) {}
-    fn on_video_src_disconnect(&self) {}
-    fn on_audio_format(&self, _info: &AudioStreamInfo) {}
+    fn on_video_src_disconnect(&self, _generation: airplay_server::StreamGeneration) {}
+    fn on_audio_format(
+        &self,
+        _info: &AudioStreamInfo,
+        _generation: airplay_server::StreamGeneration,
+    ) {
+    }
     fn on_audio(&self, _data: &[u8]) {}
-    fn on_audio_src_disconnect(&self) {}
+    fn on_audio_src_disconnect(&self, _generation: airplay_server::StreamGeneration) {}
 
     fn on_volume(&self, volume_db: f64) {
         *self.volume_db.lock().expect("volume lock") = Some(volume_db);
+    }
+
+    fn on_mute(&self, muted: bool) {
+        *self.muted.lock().expect("mute lock") = Some(muted);
     }
 
     fn volume(&self) -> Option<f64> {
@@ -236,5 +261,79 @@ async fn volume_set_parameter_ignores_unrelated_and_invalid_values() {
     }
 
     assert_eq!(*consumer.volume_db.lock().expect("volume lock"), None);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn volume_zero_db_is_maximum_not_mute() {
+    let consumer = Arc::new(RecordingVolumeConsumer::default());
+    let mut server = AirPlayServer::new(AirPlayConfig::default(), consumer.clone());
+    server.start().await.expect("start server");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port()))
+        .await
+        .expect("connect");
+    let body = "volume: 0.000000\r\n";
+    let request = format!(
+        "SET_PARAMETER /stream RTSP/1.0\r\nCSeq: 30\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let response = read_http_like_response(&mut stream).await;
+    assert!(String::from_utf8_lossy(&response).starts_with("RTSP/1.0 200"));
+    assert_eq!(
+        *consumer.volume_db.lock().expect("volume lock"),
+        Some(0.0),
+        "AirPlay 0 dB must mean maximum volume, not mute"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn set_property_http_volume_and_mute() {
+    let consumer = Arc::new(RecordingVolumeConsumer::default());
+    let mut server = AirPlayServer::new(AirPlayConfig::default(), consumer.clone());
+    server.start().await.expect("start server");
+    let port = server.port();
+
+    // volume plist
+    let mut dict = plist::Dictionary::new();
+    dict.insert("volume".into(), plist::Value::Real(-18.0));
+    let mut body = Vec::new();
+    plist::Value::Dictionary(dict)
+        .to_writer_binary(&mut body)
+        .unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!(
+        "PUT /setProperty HTTP/1.1\r\nHost: x\r\nX-Apple-Session-ID: s1\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+    let response = read_http_like_response(&mut stream).await;
+    assert!(String::from_utf8_lossy(&response).contains("200"));
+    assert_eq!(
+        *consumer.volume_db.lock().expect("volume lock"),
+        Some(-18.0)
+    );
+
+    // muted plist
+    let mut dict = plist::Dictionary::new();
+    dict.insert("muted".into(), plist::Value::Boolean(true));
+    let mut body = Vec::new();
+    plist::Value::Dictionary(dict)
+        .to_writer_binary(&mut body)
+        .unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!(
+        "PUT /setProperty HTTP/1.1\r\nHost: x\r\nX-Apple-Session-ID: s1\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+    let response = read_http_like_response(&mut stream).await;
+    assert!(String::from_utf8_lossy(&response).contains("200"));
+    assert_eq!(*consumer.muted.lock().expect("mute lock"), Some(true));
+
     server.stop().await;
 }
