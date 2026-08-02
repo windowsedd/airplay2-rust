@@ -102,7 +102,7 @@ impl Pairing {
         let shared = our_secret.diffie_hellman(&their_public);
         let ecdh_secret = *shared.as_bytes();
 
-        tracing::info!(secret = %hex_encode(&ecdh_secret), "Shared secret");
+        tracing::debug!("Pairing shared secret established");
 
         self.ed_theirs = Some(ed_theirs);
         self.ecdh_ours = Some(ecdh_ours);
@@ -196,8 +196,4 @@ impl Pairing {
 
         Ok(Aes128Ctr::new(&aes_key.into(), &aes_iv.into()))
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

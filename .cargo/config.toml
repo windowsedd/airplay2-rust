@@ -1,8 +1,7 @@
 # Workspace cargo config
 #
 # Default features include GStreamer. On Windows the built EXE needs GStreamer
-# DLLs at *runtime* (PATH), not only at compile time — otherwise you get:
-#   exit code 0xC0000135 STATUS_DLL_NOT_FOUND
+# DLLs at *runtime* (PATH), not only at compile time.
 #
 # [env] only affects build scripts/rustc, NOT cargo run of the final binary.
 # The [target.*.runner] wraps cargo run / cargo test so PATH is set first.

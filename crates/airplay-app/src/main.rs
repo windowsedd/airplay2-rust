@@ -80,6 +80,9 @@ struct PlayerSection {
     /// Detect landscape game vs home UI (stream size + letterbox crop).
     #[serde(default = "default_detect_game")]
     detect_game: bool,
+    /// AirPlay volume sync: `player` (GStreamer gain, default) | `system` | `disabled`.
+    #[serde(default = "default_volume_sync")]
+    volume_sync: String,
 }
 
 impl Default for PlayerSection {
@@ -92,6 +95,7 @@ impl Default for PlayerSection {
             rotate: default_rotate(),
             auto_rotate: default_auto_rotate(),
             detect_game: default_detect_game(),
+            volume_sync: default_volume_sync(),
         }
     }
 }
@@ -169,6 +173,10 @@ fn default_auto_rotate() -> bool {
 fn default_detect_game() -> bool {
     true
 }
+fn default_volume_sync() -> String {
+    // Software only: AirPlay slider drives the GStreamer volume element.
+    "player".into()
+}
 
 /// Resolve effective rotate mode string from config.
 fn effective_rotate(player: &PlayerSection) -> String {
@@ -203,6 +211,7 @@ fn default_config() -> AppConfig {
             rotate: default_rotate(),
             auto_rotate: default_auto_rotate(),
             detect_game: default_detect_game(),
+            volume_sync: default_volume_sync(),
         },
     }
 }
@@ -268,6 +277,8 @@ fn load_config(path: Option<&Path>) -> Result<(AppConfig, PathBuf)> {
         "auto_rotate = true\n",
         "rotate = \"auto\"\n",
         "detect_game = true\n",
+        "# AirPlay volume: player (GStreamer gain) | system | disabled\n",
+        "volume_sync = \"player\"\n",
     );
     let mut used = PathBuf::from("config.toml");
     for path in [
@@ -348,6 +359,7 @@ fn build_auto_consumer(
     detect_game: bool,
     preview_mode: airplay_player::PreviewMode,
     hardware_decode: bool,
+    volume_sync: airplay_player::VolumeSyncMode,
 ) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
     use airplay_server::AirPlayConsumer;
 
@@ -357,7 +369,7 @@ fn build_auto_consumer(
     let mut have_live_window = false;
 
     #[cfg(not(feature = "gstreamer"))]
-    let _ = (preview_mode, hardware_decode);
+    let _ = (preview_mode, hardware_decode, volume_sync);
 
     // 1) Always dump for debugging (file only — no extra window).
     #[cfg(feature = "h264-dump")]
@@ -371,7 +383,13 @@ fn build_auto_consumer(
     // 2) One live window only: prefer GStreamer (video + ALAC/AAC-ELD).
     #[cfg(feature = "gstreamer")]
     {
-        match airplay_player::GStreamerPlayer::with_preview(1.0, preview_mode, hardware_decode) {
+        match airplay_player::GStreamerPlayer::with_volume_sync(
+            1.0,
+            preview_mode,
+            hardware_decode,
+            volume_sync,
+            None,
+        ) {
             Ok(p) => {
                 parts.push(Box::new(p));
                 labels.push("gstreamer");
@@ -379,6 +397,7 @@ fn build_auto_consumer(
                 tracing::info!(
                     preview_mode = %preview_mode,
                     hardware_decode,
+                    ?volume_sync,
                     "GStreamer direct live window ready"
                 );
             }
@@ -455,12 +474,18 @@ fn build_consumer(
     detect_game: bool,
     preview_mode: airplay_player::PreviewMode,
     hardware_decode: bool,
+    volume_sync: airplay_player::VolumeSyncMode,
 ) -> Result<Arc<dyn airplay_server::AirPlayConsumer>> {
     let impl_key = implementation.to_ascii_lowercase();
     match impl_key.as_str() {
-        "auto" | "default" | "mirror" => {
-            build_auto_consumer(output, rotate, detect_game, preview_mode, hardware_decode)
-        }
+        "auto" | "default" | "mirror" => build_auto_consumer(
+            output,
+            rotate,
+            detect_game,
+            preview_mode,
+            hardware_decode,
+            volume_sync,
+        ),
         "h264-dump" | "h264_dump" | "dump" => {
             #[cfg(feature = "h264-dump")]
             {
@@ -477,15 +502,18 @@ fn build_consumer(
         "gstreamer" | "gst" => {
             #[cfg(feature = "gstreamer")]
             {
-                let player = airplay_player::GStreamerPlayer::with_preview(
+                let player = airplay_player::GStreamerPlayer::with_volume_sync(
                     1.0,
                     preview_mode,
                     hardware_decode,
+                    volume_sync,
+                    None,
                 )
                 .map_err(|e| anyhow::anyhow!("GStreamer player: {e}"))?;
                 tracing::info!(
                     preview_mode = %preview_mode,
                     hardware_decode,
+                    ?volume_sync,
                     "player: gstreamer direct preview"
                 );
                 Ok(Arc::new(player))
@@ -531,8 +559,42 @@ fn build_consumer(
     }
 }
 
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<Any>".into()
+        };
+        // Prefer structured log; also print so headless runs still see it.
+        eprintln!("PANIC thread={name} location={location} payload={payload}");
+        tracing::error!(
+            thread = name,
+            location = %location,
+            payload = %payload,
+            "application panic"
+        );
+        // Backtrace when RUST_BACKTRACE is set (std captures it).
+        let bt = std::backtrace::Backtrace::force_capture();
+        tracing::error!(backtrace = %bt, "panic backtrace");
+        eprintln!("{bt}");
+        default_hook(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_panic_hook();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -569,6 +631,7 @@ async fn main() -> Result<()> {
 
     let implementation = resolve_implementation(&cfg.player.implementation);
     let (preview_mode, hardware_decode) = parse_preview_settings(&cfg.player)?;
+    let volume_sync = airplay_player::VolumeSyncMode::parse(&cfg.player.volume_sync);
     let rotate = effective_rotate(&cfg.player);
     let detect_game = cfg.player.detect_game;
     let dump_path = PathBuf::from(&cfg.player.output);
@@ -581,6 +644,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         preview_mode = %preview_mode,
         hardware_decode,
+        ?volume_sync,
         "video preview settings"
     );
     let consumer = build_consumer(
@@ -590,6 +654,7 @@ async fn main() -> Result<()> {
         detect_game,
         preview_mode,
         hardware_decode,
+        volume_sync,
     )
     .with_context(|| {
         format!(

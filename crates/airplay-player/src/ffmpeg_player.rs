@@ -15,7 +15,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use airplay_lib::{AudioStreamInfo, VideoStreamInfo};
-use airplay_server::AirPlayConsumer;
+use airplay_server::{AirPlayConsumer, StreamGeneration};
+
+use crate::lifecycle::{GenerationGate, PlayerLifecycle};
 
 const MAX_BUFFER: usize = 4 * 1024 * 1024;
 
@@ -60,6 +62,8 @@ pub struct FFmpegPlayer {
     last_size: Mutex<(u32, u32)>,
     /// Active transpose filter for next spawn (`None` = no -vf).
     vf_transpose: Mutex<Option<&'static str>>,
+    video_generation: GenerationGate,
+    video_lifecycle: PlayerLifecycle,
 }
 
 impl FFmpegPlayer {
@@ -83,6 +87,8 @@ impl FFmpegPlayer {
             rotate_mode,
             last_size: Mutex::new((0, 0)),
             vf_transpose: Mutex::new(None),
+            video_generation: GenerationGate::new(),
+            video_lifecycle: PlayerLifecycle::new(),
         })
     }
 
@@ -325,6 +331,21 @@ impl FFmpegPlayer {
         }
         self.started.store(false, Ordering::SeqCst);
     }
+
+    fn stop_if_owner(&self, generation: StreamGeneration) {
+        if !self.video_generation.stop_if_owner(generation) {
+            return;
+        }
+        if !self.video_lifecycle.begin_stop() {
+            return;
+        }
+        tracing::info!(generation, "video disconnected; stopping ffplay");
+        self.stop_process();
+        if let Ok(mut p) = self.pending.lock() {
+            p.clear();
+        }
+        self.video_lifecycle.mark_stopped();
+    }
 }
 
 fn has_h264_sps(buf: &[u8]) -> bool {
@@ -404,9 +425,13 @@ impl Default for FFmpegPlayer {
 }
 
 impl AirPlayConsumer for FFmpegPlayer {
-    fn on_video_format(&self, info: &VideoStreamInfo) {
+    fn on_video_format(&self, info: &VideoStreamInfo, generation: StreamGeneration) {
+        self.video_generation.claim(generation);
+        self.video_lifecycle.reset_for_start();
+        self.video_lifecycle.mark_starting();
         tracing::info!(
             stream_connection_id = %info.stream_connection_id,
+            generation,
             "video format — will start ffplay after first SPS/frames (not empty pre-start)"
         );
         // Reset stream state for a new mirror session.
@@ -421,6 +446,7 @@ impl AirPlayConsumer for FFmpegPlayer {
             *v = None;
         }
         self.frames.store(0, Ordering::SeqCst);
+        self.video_lifecycle.mark_playing();
     }
 
     fn on_video_size(&self, width: u32, height: u32) {
@@ -513,22 +539,20 @@ impl AirPlayConsumer for FFmpegPlayer {
         }
     }
 
-    fn on_video_src_disconnect(&self) {
-        tracing::info!("video disconnected; stopping ffplay");
-        self.stop_process();
-        if let Ok(mut p) = self.pending.lock() {
-            p.clear();
-        }
+    fn on_video_src_disconnect(&self, generation: StreamGeneration) {
+        self.stop_if_owner(generation);
         self.frames.store(0, Ordering::SeqCst);
     }
 
-    fn on_audio_format(&self, info: &AudioStreamInfo) {
-        tracing::info!(?info, "audio ignored by ffplay video backend");
+    fn on_audio_format(&self, info: &AudioStreamInfo, generation: StreamGeneration) {
+        tracing::info!(?info, generation, "audio ignored by ffplay video backend");
     }
 
     fn on_audio(&self, _data: &[u8]) {}
 
-    fn on_audio_src_disconnect(&self) {}
+    fn on_audio_src_disconnect(&self, generation: StreamGeneration) {
+        tracing::debug!(generation, "audio source disconnected (ffplay ignores audio)");
+    }
 }
 
 impl Drop for FFmpegPlayer {

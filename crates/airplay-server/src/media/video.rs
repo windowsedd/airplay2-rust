@@ -22,31 +22,42 @@ pub async fn bind() -> std::io::Result<(TcpListener, u16)> {
 }
 
 /// Spawn the video accept loop. Abort the returned handle on TEARDOWN.
+///
+/// `generation` identifies this SETUP's media server. TCP EOF on a video client
+/// does **not** stop the player — TEARDOWN issues owner-checked disconnects so a
+/// replaced stream (YouTube, etc.) cannot kill generation N+1.
 pub fn run_accept(
     listener: TcpListener,
     airplay: Arc<Mutex<AirPlay>>,
     consumer: Arc<dyn AirPlayConsumer>,
+    generation: crate::consumer::StreamGeneration,
 ) -> AbortHandle {
     let join = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    info!(%peer, "video client connected");
+                    info!(%peer, generation, "video client connected");
                     let airplay = Arc::clone(&airplay);
                     let consumer = Arc::clone(&consumer);
                     tokio::spawn(async move {
                         if let Err(e) = handle_video_connection(stream, airplay, consumer).await {
-                            debug!(%peer, "video connection closed: {e}");
+                            // Normal on sender pause/replace; never fatal to the receiver.
+                            debug!(%peer, generation, "video connection closed: {e}");
                         }
+                        debug!(
+                            generation,
+                            "video client task finished (player left to TEARDOWN/owner checks)"
+                        );
                     });
                 }
                 Err(e) => {
                     // Listener closed / aborted — exit accept loop.
-                    debug!("video accept ended: {e}");
+                    debug!(generation, "video accept ended: {e}");
                     break;
                 }
             }
         }
+        info!(generation, "video accept task exited");
     });
     join.abort_handle()
 }

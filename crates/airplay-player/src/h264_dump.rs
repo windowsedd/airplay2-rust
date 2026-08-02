@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use airplay_lib::{AudioStreamInfo, VideoStreamInfo};
-use airplay_server::AirPlayConsumer;
+use airplay_server::{AirPlayConsumer, StreamGeneration};
+
+use crate::lifecycle::GenerationGate;
 
 /// Writes decrypted video annex-B (or raw NAL) bytes to a file.
 ///
@@ -15,6 +17,7 @@ use airplay_server::AirPlayConsumer;
 pub struct H264Dump {
     path: PathBuf,
     file: Mutex<File>,
+    video_generation: GenerationGate,
 }
 
 impl H264Dump {
@@ -30,6 +33,7 @@ impl H264Dump {
         Ok(Self {
             path,
             file: Mutex::new(file),
+            video_generation: GenerationGate::new(),
         })
     }
 
@@ -40,9 +44,11 @@ impl H264Dump {
 }
 
 impl AirPlayConsumer for H264Dump {
-    fn on_video_format(&self, info: &VideoStreamInfo) {
+    fn on_video_format(&self, info: &VideoStreamInfo, generation: StreamGeneration) {
+        self.video_generation.claim(generation);
         tracing::info!(
             stream_connection_id = %info.stream_connection_id,
+            generation,
             path = %self.path.display(),
             "video format; dumping H.264 to file"
         );
@@ -64,13 +70,20 @@ impl AirPlayConsumer for H264Dump {
         }
     }
 
-    fn on_video_src_disconnect(&self) {
+    fn on_video_src_disconnect(&self, generation: StreamGeneration) {
+        if !self.video_generation.stop_if_owner(generation) {
+            return;
+        }
         match self.file.lock() {
             Ok(mut file) => {
                 if let Err(e) = file.flush() {
                     tracing::warn!(error = %e, "failed to flush video dump");
                 } else {
-                    tracing::info!(path = %self.path.display(), "video source disconnected; dump flushed");
+                    tracing::info!(
+                        generation,
+                        path = %self.path.display(),
+                        "video source disconnected; dump flushed"
+                    );
                 }
             }
             Err(e) => {
@@ -79,16 +92,19 @@ impl AirPlayConsumer for H264Dump {
         }
     }
 
-    fn on_audio_format(&self, info: &AudioStreamInfo) {
-        tracing::info!(?info, "audio format (ignored by h264-dump)");
+    fn on_audio_format(&self, info: &AudioStreamInfo, generation: StreamGeneration) {
+        tracing::info!(?info, generation, "audio format (ignored by h264-dump)");
     }
 
     fn on_audio(&self, _data: &[u8]) {
         // Video-only dump backend; ignore audio samples.
     }
 
-    fn on_audio_src_disconnect(&self) {
-        tracing::debug!("audio source disconnected (h264-dump ignores audio)");
+    fn on_audio_src_disconnect(&self, generation: StreamGeneration) {
+        tracing::debug!(
+            generation,
+            "audio source disconnected (h264-dump ignores audio)"
+        );
     }
 }
 
@@ -106,14 +122,40 @@ mod tests {
         let path = dir.join("dump.h264");
 
         let dump = H264Dump::new(&path).expect("create dump");
-        dump.on_video_format(&VideoStreamInfo::new("conn-1"));
+        dump.on_video_format(&VideoStreamInfo::new("conn-1"), 1);
         dump.on_video(b"\x00\x00\x00\x01\x67nalu");
         dump.on_video(b"more");
-        dump.on_video_src_disconnect();
+        dump.on_video_src_disconnect(1);
 
         let written = std::fs::read(&path).expect("read dump");
         assert_eq!(written, b"\x00\x00\x00\x01\x67nalumore");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_video_disconnect_is_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "airplay-h264-dump-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.h264");
+
+        let dump = H264Dump::new(&path).expect("create dump");
+        dump.on_video_format(&VideoStreamInfo::new("conn-1"), 1);
+        dump.on_video(b"aaa");
+        // Newer generation claims the dump.
+        dump.on_video_format(&VideoStreamInfo::new("conn-2"), 2);
+        dump.on_video(b"bbb");
+        // Stale disconnect must not be treated as fatal / must be ignored.
+        dump.on_video_src_disconnect(1);
+        dump.on_video(b"ccc");
+        dump.on_video_src_disconnect(2);
+
+        let written = std::fs::read(&path).expect("read dump");
+        assert_eq!(written, b"aaabbbccc");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

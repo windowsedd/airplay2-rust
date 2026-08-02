@@ -9,13 +9,17 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 
 use airplay_lib::{AudioStreamInfo, VideoStreamInfo};
-use airplay_server::AirPlayConsumer;
+use airplay_server::{AirPlayConsumer, StreamGeneration};
+
+use crate::lifecycle::{GenerationGate, PlayerLifecycle};
 
 /// Pipes decrypted H.264 to a VLC child process (best-effort).
 pub struct VlcPlayer {
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
     binary: String,
+    video_generation: GenerationGate,
+    video_lifecycle: PlayerLifecycle,
 }
 
 impl VlcPlayer {
@@ -26,6 +30,8 @@ impl VlcPlayer {
             child: Mutex::new(None),
             stdin: Mutex::new(None),
             binary,
+            video_generation: GenerationGate::new(),
+            video_lifecycle: PlayerLifecycle::new(),
         })
     }
 
@@ -111,14 +117,20 @@ impl Default for VlcPlayer {
 }
 
 impl AirPlayConsumer for VlcPlayer {
-    fn on_video_format(&self, info: &VideoStreamInfo) {
+    fn on_video_format(&self, info: &VideoStreamInfo, generation: StreamGeneration) {
+        self.video_generation.claim(generation);
+        self.video_lifecycle.reset_for_start();
+        self.video_lifecycle.mark_starting();
         tracing::info!(
             stream_connection_id = %info.stream_connection_id,
+            generation,
             "video format; ensuring VLC process"
         );
         if let Err(e) = self.ensure_started() {
             tracing::error!(error = %e, "could not start VLC");
+            return;
         }
+        self.video_lifecycle.mark_playing();
     }
 
     fn on_video(&self, data: &[u8]) {
@@ -141,21 +153,35 @@ impl AirPlayConsumer for VlcPlayer {
         }
     }
 
-    fn on_video_src_disconnect(&self) {
-        tracing::info!("video source disconnected; stopping VLC");
+    fn on_video_src_disconnect(&self, generation: StreamGeneration) {
+        if !self.video_generation.stop_if_owner(generation) {
+            return;
+        }
+        if !self.video_lifecycle.begin_stop() {
+            return;
+        }
+        tracing::info!(generation, "video source disconnected; stopping VLC");
         self.stop_process();
+        self.video_lifecycle.mark_stopped();
     }
 
-    fn on_audio_format(&self, info: &AudioStreamInfo) {
-        tracing::info!(?info, "audio format (ignored by VLC video-only backend)");
+    fn on_audio_format(&self, info: &AudioStreamInfo, generation: StreamGeneration) {
+        tracing::info!(
+            ?info,
+            generation,
+            "audio format (ignored by VLC video-only backend)"
+        );
     }
 
     fn on_audio(&self, _data: &[u8]) {
         // Video-only backend.
     }
 
-    fn on_audio_src_disconnect(&self) {
-        tracing::debug!("audio source disconnected (VLC backend ignores audio)");
+    fn on_audio_src_disconnect(&self, generation: StreamGeneration) {
+        tracing::debug!(
+            generation,
+            "audio source disconnected (VLC backend ignores audio)"
+        );
     }
 }
 

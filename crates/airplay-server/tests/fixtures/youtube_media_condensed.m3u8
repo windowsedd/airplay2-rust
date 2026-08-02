@@ -1,0 +1,4 @@
+#EXTM3U
+#YT-EXT-CONDENSED-URL:BASE-URI="https://example.invalid/videoplayback",PREFIX="seg/",PARAMS="id,range"
+#EXTINF:2.0,
+seg/demo/0-999
